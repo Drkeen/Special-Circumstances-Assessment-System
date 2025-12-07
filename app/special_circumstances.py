@@ -12,6 +12,7 @@ from decimal import Decimal
 from openai import OpenAI
 
 from .models import WorkbookUnitSummary, UnitSummaryRow
+from .pdf_to_images import convert_pdf_to_images  # NEW: PDF → image converter
 
 # -------------------------------------------------------------------
 # Configuration
@@ -167,7 +168,7 @@ def _extract_text_from_docx(path: Path) -> str:
     try:
         from docx import Document  # type: ignore
     except ImportError:
-        # Library not installed – return empty text but note in caller if needed
+        # Library not installed – return empty text
         return ""
 
     try:
@@ -408,8 +409,21 @@ def generate_special_circumstances_report(
     instructions_text = _load_instructions_text(instructions_path)
     case_text = _build_case_text_payload(inputs)
 
-    # Split documents again for images to attach
+    # Split documents for images and text
     images, txts, docxs, pdfs = _split_docs_by_type(inputs.supporting_document_paths)
+
+    # NEW: convert each PDF to one or more page images for the vision model
+    pdf_image_paths: List[Path] = []
+    for pdf in pdfs:
+        try:
+            page_images = convert_pdf_to_images(pdf)
+            pdf_image_paths.extend(page_images)
+        except Exception:
+            # If conversion fails, we just skip images for that PDF
+            continue
+
+    # Combine original images + PDF-derived images
+    all_image_paths: List[Path] = list(images) + list(pdf_image_paths)
 
     # Build the multimodal content list for the 'user' message
     user_content: List[dict] = [
@@ -438,8 +452,8 @@ def generate_special_circumstances_report(
         }
     ]
 
-    # Attach each image document for the vision model
-    for path in images:
+    # Attach each image document for the vision model (PNG/JPEG + PDF pages)
+    for path in all_image_paths:
         data_url = _encode_image_to_data_url(path)
         if not data_url:
             continue
