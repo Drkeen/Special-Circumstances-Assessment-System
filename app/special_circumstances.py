@@ -26,8 +26,11 @@ DEFAULT_INSTRUCTIONS_PATH = (
     Path(__file__).resolve().parent.parent / "instructions.txt"
 )
 
-# Supported doc extensions for vision
-SUPPORTED_DOC_EXTS = {".png", ".jpg", ".jpeg", ".pdf"}
+# Filetype groups
+IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
+TEXT_EXTS = {".txt"}
+DOCX_EXTS = {".docx"}
+PDF_EXTS = {".pdf"}
 
 
 @dataclass
@@ -41,7 +44,7 @@ class SpecialCircumstancesInputs:
     workbook_summary: WorkbookUnitSummary
     financial_report_text: str
 
-    # Local file paths to supporting docs (images/PDFs)
+    # Local file paths to supporting docs (any of the supported types)
     supporting_document_paths: List[Path]
 
     # Optional extra notes from the case officer (free text)
@@ -62,7 +65,7 @@ class SpecialCircumstancesResult:
 
 
 # -------------------------------------------------------------------
-# Helpers
+# Helpers – instructions, dates, units
 # -------------------------------------------------------------------
 
 
@@ -122,35 +125,158 @@ def _format_units_block(units: List[UnitSummaryRow]) -> str:
     return "\n".join(lines)
 
 
-def _encode_file_to_data_url(path: Path) -> Optional[str]:
+# -------------------------------------------------------------------
+# Helpers – file handling & text extraction
+# -------------------------------------------------------------------
+
+
+def _encode_image_to_data_url(path: Path) -> Optional[str]:
     """
-    Encode an image/PDF file as a data URL for use with OpenAI vision.
+    Encode an image file as a data URL for use with OpenAI vision.
 
     Returns a string like:
       data:image/png;base64,....
 
-    If the extension is not supported, returns None.
+    If the extension is not an image, returns None.
     """
     ext = path.suffix.lower()
-    if ext not in SUPPORTED_DOC_EXTS:
+    if ext not in IMAGE_EXTS:
         return None
 
-    mime = None
-    if ext in {".png"}:
+    if ext == ".png":
         mime = "image/png"
-    elif ext in {".jpg", ".jpeg"}:
+    else:
         mime = "image/jpeg"
-    elif ext == ".pdf":
-        # Many student PDFs are screenshots in a PDF wrapper.
-        # OpenAI's vision models can usually handle this as a document.
-        mime = "application/pdf"
-
-    if mime is None:
-        return None
 
     data = path.read_bytes()
     b64 = b64encode(data).decode("ascii")
     return f"data:{mime};base64,{b64}"
+
+
+def _extract_text_from_txt(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _extract_text_from_docx(path: Path) -> str:
+    """
+    Extract text from a .docx file using python-docx.
+    """
+    try:
+        from docx import Document  # type: ignore
+    except ImportError:
+        # Library not installed – return empty text but note in caller if needed
+        return ""
+
+    try:
+        doc = Document(str(path))
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        return "\n".join(paragraphs)
+    except Exception:
+        return ""
+
+
+def _extract_text_from_pdf(path: Path) -> str:
+    """
+    Extract text from a PDF using PyPDF2.
+
+    NOTE:
+    - This works well for text-based PDFs.
+    - For screenshot-only PDFs, text may be empty.
+    """
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+    except ImportError:
+        return ""
+
+    try:
+        reader = PdfReader(str(path))
+        texts: List[str] = []
+        for page in reader.pages:
+            try:
+                t = page.extract_text() or ""
+            except Exception:
+                t = ""
+            if t.strip():
+                texts.append(t)
+        return "\n\n".join(texts)
+    except Exception:
+        return ""
+
+
+def _split_docs_by_type(
+    paths: List[Path],
+) -> tuple[list[Path], list[Path], list[Path], list[Path]]:
+    """
+    Split document paths into (images, txt, docx, pdf).
+    """
+    images: list[Path] = []
+    txts: list[Path] = []
+    docxs: list[Path] = []
+    pdfs: list[Path] = []
+
+    for p in paths:
+        ext = p.suffix.lower()
+        if ext in IMAGE_EXTS:
+            images.append(p)
+        elif ext in TEXT_EXTS:
+            txts.append(p)
+        elif ext in DOCX_EXTS:
+            docxs.append(p)
+        elif ext in PDF_EXTS:
+            pdfs.append(p)
+        # other extensions are ignored for now
+
+    return images, txts, docxs, pdfs
+
+
+def _build_supporting_docs_text(
+    txt_paths: List[Path],
+    docx_paths: List[Path],
+    pdf_paths: List[Path],
+    max_chars_per_doc: int = 2000,
+) -> str:
+    """
+    Build a block of text containing extracted contents of txt/docx/pdf files.
+
+    We truncate each document's text to avoid blowing out the context window.
+    """
+    sections: List[str] = []
+
+    def add_doc_section(label: str, path: Path, content: str) -> None:
+        if not content.strip():
+            sections.append(
+                f"----\nDocument: {path.name} ({label})\n[No machine-readable text could be extracted.]"
+            )
+        else:
+            truncated = content.strip()
+            if len(truncated) > max_chars_per_doc:
+                truncated = truncated[:max_chars_per_doc] + "\n[Text truncated...]"
+            sections.append(
+                f"----\nDocument: {path.name} ({label})\nExtracted text:\n{truncated}"
+            )
+
+    # TXT files
+    for p in txt_paths:
+        content = _extract_text_from_txt(p)
+        add_doc_section("TXT", p, content)
+
+    # DOCX files
+    for p in docx_paths:
+        content = _extract_text_from_docx(p)
+        add_doc_section("DOCX", p, content)
+
+    # PDFs
+    for p in pdf_paths:
+        content = _extract_text_from_pdf(p)
+        add_doc_section("PDF", p, content)
+
+    if not sections:
+        return "No machine-readable text could be extracted from supporting documents."
+
+    return "\n\n".join(sections)
 
 
 def _build_case_text_payload(inputs: SpecialCircumstancesInputs) -> str:
@@ -187,12 +313,25 @@ def _build_case_text_payload(inputs: SpecialCircumstancesInputs) -> str:
     # Units in scope
     units_block = _format_units_block(inputs.workbook_summary.units)
 
+    # Split docs by type
+    images, txts, docxs, pdfs = _split_docs_by_type(inputs.supporting_document_paths)
+
     # Supporting documentation – filename view
     if inputs.supporting_document_paths:
-        docs_lines = [
-            f"- {p.name} (loaded from {p})"
-            for p in inputs.supporting_document_paths
-        ]
+        docs_lines = []
+        for p in inputs.supporting_document_paths:
+            ext = p.suffix.lower()
+            if ext in IMAGE_EXTS:
+                kind = "image"
+            elif ext in TEXT_EXTS:
+                kind = "txt"
+            elif ext in DOCX_EXTS:
+                kind = "docx"
+            elif ext in PDF_EXTS:
+                kind = "pdf"
+            else:
+                kind = "other"
+            docs_lines.append(f"- {p.name} ({kind})")
         docs_block = "\n".join(docs_lines)
     else:
         docs_block = "No supporting documents were found for this case."
@@ -207,6 +346,9 @@ def _build_case_text_payload(inputs: SpecialCircumstancesInputs) -> str:
     # Financial report already generated
     financial_block = inputs.financial_report_text.strip()
 
+    # Extracted text from txt/docx/pdf
+    docs_text_block = _build_supporting_docs_text(txts, docxs, pdfs)
+
     return f"""
 {meta_block}
 
@@ -214,9 +356,13 @@ UNITS IN SCOPE
 --------------
 {units_block}
 
-SUPPORTING DOCUMENTS (FILENAMES)
---------------------------------
+SUPPORTING DOCUMENTS (FILENAMES & TYPES)
+----------------------------------------
 {docs_block}
+
+SUPPORTING DOCUMENT CONTENT (MACHINE-EXTRACTED TEXT)
+----------------------------------------------------
+{docs_text_block}
 
 CASE OFFICER NOTES
 ------------------
@@ -245,7 +391,7 @@ def generate_special_circumstances_report(
 ) -> SpecialCircumstancesResult:
     """
     Generate a Special Circumstances Investigation Report by calling OpenAI
-    with both text and supporting documents (images/PDFs).
+    with both text and supporting documents (images + extracted text).
 
     - Reads instructions.txt (which you can keep updating).
     - Uses the workbook summary + financial report + supporting docs.
@@ -261,6 +407,9 @@ def generate_special_circumstances_report(
 
     instructions_text = _load_instructions_text(instructions_path)
     case_text = _build_case_text_payload(inputs)
+
+    # Split documents again for images to attach
+    images, txts, docxs, pdfs = _split_docs_by_type(inputs.supporting_document_paths)
 
     # Build the multimodal content list for the 'user' message
     user_content: List[dict] = [
@@ -289,9 +438,9 @@ def generate_special_circumstances_report(
         }
     ]
 
-    # Attach each supporting document as an image/PDF for the vision model
-    for path in inputs.supporting_document_paths:
-        data_url = _encode_file_to_data_url(path)
+    # Attach each image document for the vision model
+    for path in images:
+        data_url = _encode_image_to_data_url(path)
         if not data_url:
             continue
         user_content.append(

@@ -190,8 +190,16 @@ if sc_enabled:
         support_files: list[Path] = []
         if support_dir.exists() and support_dir.is_dir():
             for p in support_dir.iterdir():
-                if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg", ".pdf"}:
+                if p.is_file() and p.suffix.lower() in {
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".pdf",
+                    ".txt",
+                    ".docx",
+                }:
                     support_files.append(p)
+
 
         if not support_files:
             st.info(
