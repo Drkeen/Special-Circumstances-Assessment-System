@@ -14,21 +14,24 @@ from openai import OpenAI
 
 from .models import WorkbookUnitSummary, UnitSummaryRow
 from .pdf_to_images import convert_pdf_to_images  # PDF → image converter
+from .financial_report import FinancialBreakdown
+
+# Category names must match financial_report
+CATEGORY_PRE = "PreEASD EWID"
+CATEGORY_POST = "PostEASD EWID"
+CATEGORY_FEE = "Fee Waiver"
+ADMIN_FEE = Decimal("100.00")
 
 # -------------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------------
 
-# Default model – change this to whatever you want in your account
-# e.g. "gpt-4.1", "gpt-4o", "gpt-5.1", etc.
 DEFAULT_MODEL = os.environ.get("SCAS_LLM_MODEL", "gpt-4.1")
 
-# Where we expect to find instructions.txt by default
 DEFAULT_INSTRUCTIONS_PATH = (
     Path(__file__).resolve().parent.parent / "instructions.txt"
 )
 
-# Filetype groups
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 TEXT_EXTS = {".txt"}
 DOCX_EXTS = {".docx"}
@@ -38,57 +41,44 @@ PDF_EXTS = {".pdf"}
 @dataclass
 class SpecialCircumstancesInputs:
     """
-    Container for all data needed to generate a Special Circumstances
-    investigation report for ONE case.
+    All inputs needed to generate the Special Circumstances Investigation Report.
     """
-
     date_requested: date
     workbook_summary: WorkbookUnitSummary
     financial_report_text: str
-
-    # Local file paths to supporting docs (any of the supported types)
     supporting_document_paths: List[Path]
 
-    # Optional extra notes from the case officer (free text)
     case_officer_notes: Optional[str] = None
-
-    # Optional student/case metadata
     student_name: Optional[str] = None
     student_number: Optional[str] = None
     program_name: Optional[str] = None
     campus: Optional[str] = None
-    study_period_description: Optional[str] = None  # e.g. "Semester 2 2025"
+    study_period_description: Optional[str] = None
+
+    # Structured financials from financial_report.compute_financial_breakdown
+    financial_breakdown: Optional[FinancialBreakdown] = None
 
 
 @dataclass
 class SpecialCircumstancesResult:
-    """Output of the generator – currently just the report text."""
     report_text: str
 
 
 # -------------------------------------------------------------------
-# Helpers – instructions, dates, units
+# Basic helpers
 # -------------------------------------------------------------------
 
 
 def _load_instructions_text(
     instructions_path: Optional[Path] = None,
 ) -> str:
-    """
-    Load the contents of instructions.txt.
-
-    You can keep editing instructions.txt and the app will always use
-    the latest version next time it runs.
-    """
     path = instructions_path or DEFAULT_INSTRUCTIONS_PATH
-
     if not path.exists():
         raise FileNotFoundError(
             f"Instructions file not found at {path}. "
             f"Update DEFAULT_INSTRUCTIONS_PATH in special_circumstances.py "
             f"or pass instructions_path explicitly."
         )
-
     return path.read_text(encoding="utf-8")
 
 
@@ -98,29 +88,36 @@ def _format_date(d: Optional[date]) -> str:
     return d.strftime("%d/%m/%Y")
 
 
+def _format_currency(amount: Optional[Decimal]) -> str:
+    """
+    Shared currency formatting:
+      - sign in front of $
+      - no thousands comma
+      - 2 decimal places
+    """
+    if amount is None:
+        return "N/A"
+    q = amount.quantize(Decimal("0.01"))
+    sign = "-" if q < 0 else ""
+    return f"{sign}${abs(q):.2f}"
+
+
 def _get_easd(summary: WorkbookUnitSummary) -> Optional[date]:
-    """Earliest enrolment activity start date (EASD) from the workbook summary."""
     if not summary.units:
         return None
     return min(u.start_date for u in summary.units)
 
 
 def _format_units_block(units: List[UnitSummaryRow]) -> str:
-    """
-    Format the units into a simple text block for the LLM.
-
-    Each line looks like:
-      ACMGEN301 | Status: Enrolled | Start: 14/07/2025 | Latest engagement: 20/08/2025 | Hours: 50.0 | Price: $527.00 | Liability: VFH
-    """
     if not units:
         return "No units in scope for this assessment."
 
     lines = []
     for u in units:
-        price: Optional[Decimal] = u.unit_price
-        price_str = f"${price:.2f}" if price is not None else "N/A"
-        hours_str = f"{u.recorded_hours:.2f}" if u.recorded_hours is not None else "N/A"
-
+        price_str = _format_currency(u.unit_price) if u.unit_price is not None else "N/A"
+        hours_str = (
+            f"{u.recorded_hours:.2f}" if u.recorded_hours is not None else "N/A"
+        )
         latest_eng = getattr(u, "latest_engagement_date", None)
         latest_str = _format_date(latest_eng) if latest_eng else "N/A"
 
@@ -133,19 +130,11 @@ def _format_units_block(units: List[UnitSummaryRow]) -> str:
 
 
 # -------------------------------------------------------------------
-# Helpers – file handling & text extraction
+# Supporting docs: encoding / text extraction
 # -------------------------------------------------------------------
 
 
 def _encode_image_to_data_url(path: Path) -> Optional[str]:
-    """
-    Encode an image file as a data URL for use with OpenAI vision.
-
-    Returns a string like:
-      data:image/png;base64,....
-
-    If the extension is not an image, returns None.
-    """
     ext = path.suffix.lower()
     if ext not in IMAGE_EXTS:
         return None
@@ -168,13 +157,9 @@ def _extract_text_from_txt(path: Path) -> str:
 
 
 def _extract_text_from_docx(path: Path) -> str:
-    """
-    Extract text from a .docx file using python-docx.
-    """
     try:
         from docx import Document  # type: ignore
     except ImportError:
-        # Library not installed – return empty text
         return ""
 
     try:
@@ -186,13 +171,6 @@ def _extract_text_from_docx(path: Path) -> str:
 
 
 def _extract_text_from_pdf(path: Path) -> str:
-    """
-    Extract text from a PDF using PyPDF2.
-
-    NOTE:
-    - This works well for text-based PDFs.
-    - For screenshot-only PDFs, text may be empty.
-    """
     try:
         from PyPDF2 import PdfReader  # type: ignore
     except ImportError:
@@ -216,9 +194,6 @@ def _extract_text_from_pdf(path: Path) -> str:
 def _split_docs_by_type(
     paths: List[Path],
 ) -> tuple[list[Path], list[Path], list[Path], list[Path]]:
-    """
-    Split document paths into (images, txt, docx, pdf).
-    """
     images: list[Path] = []
     txts: list[Path] = []
     docxs: list[Path] = []
@@ -234,7 +209,6 @@ def _split_docs_by_type(
             docxs.append(p)
         elif ext in PDF_EXTS:
             pdfs.append(p)
-        # other extensions are ignored for now
 
     return images, txts, docxs, pdfs
 
@@ -245,11 +219,6 @@ def _build_supporting_docs_text(
     pdf_paths: List[Path],
     max_chars_per_doc: int = 2000,
 ) -> str:
-    """
-    Build a block of text containing extracted contents of txt/docx/pdf files.
-
-    We truncate each document's text to avoid blowing out the context window.
-    """
     sections: List[str] = []
 
     def add_doc_section(label: str, path: Path, content: str) -> None:
@@ -265,17 +234,14 @@ def _build_supporting_docs_text(
                 f"----\nDocument: {path.name} ({label})\nExtracted text:\n{truncated}"
             )
 
-    # TXT files
     for p in txt_paths:
         content = _extract_text_from_txt(p)
         add_doc_section("TXT", p, content)
 
-    # DOCX files
     for p in docx_paths:
         content = _extract_text_from_docx(p)
         add_doc_section("DOCX", p, content)
 
-    # PDFs
     for p in pdf_paths:
         content = _extract_text_from_pdf(p)
         add_doc_section("PDF", p, content)
@@ -286,15 +252,14 @@ def _build_supporting_docs_text(
     return "\n\n".join(sections)
 
 
-def _build_case_text_payload(inputs: SpecialCircumstancesInputs) -> str:
-    """
-    Build the textual part of the 'user' message content describing the case.
-    This does NOT include the images themselves – those are attached separately.
-    """
+# -------------------------------------------------------------------
+# Case text payload sent to the LLM
+# -------------------------------------------------------------------
 
+
+def _build_case_text_payload(inputs: SpecialCircumstancesInputs) -> str:
     easd = _get_easd(inputs.workbook_summary)
 
-    # Basic student / case metadata
     meta_lines = [
         "CASE CONTEXT",
         "-------------",
@@ -316,14 +281,10 @@ def _build_case_text_payload(inputs: SpecialCircumstancesInputs) -> str:
         )
 
     meta_block = "\n".join(meta_lines)
-
-    # Units in scope
     units_block = _format_units_block(inputs.workbook_summary.units)
 
-    # Split docs by type
     images, txts, docxs, pdfs = _split_docs_by_type(inputs.supporting_document_paths)
 
-    # Supporting documentation – filename view
     if inputs.supporting_document_paths:
         docs_lines = []
         for p in inputs.supporting_document_paths:
@@ -343,17 +304,13 @@ def _build_case_text_payload(inputs: SpecialCircumstancesInputs) -> str:
     else:
         docs_block = "No supporting documents were found for this case."
 
-    # Case officer notes
     notes_block = (
         inputs.case_officer_notes.strip()
         if inputs.case_officer_notes and inputs.case_officer_notes.strip()
         else "No additional notes provided by the case officer."
     )
 
-    # Financial report already generated
     financial_block = inputs.financial_report_text.strip()
-
-    # Extracted text from txt/docx/pdf
     docs_text_block = _build_supporting_docs_text(txts, docxs, pdfs)
 
     return f"""
@@ -386,7 +343,7 @@ account balances, but do NOT recalculate the dollar amounts.
 
 
 # -------------------------------------------------------------------
-# Helpers – financial report post-processing
+# Financial report text parsing for Section 10–11
 # -------------------------------------------------------------------
 
 
@@ -394,16 +351,7 @@ def _extract_section2_from_financial_report(
     financial_report_text: str,
 ) -> tuple[str, Optional[str]]:
     """
-    Best-effort extraction of the 'Section 2' view (after PreEASD EWID reversals)
-    and its Adjusted Start Account Balance from the financial report text.
-
-    Current heuristic:
-      - Look for a line starting with 'Adjusted Start Account Balance:'.
-      - Take the block from the previous blank line up to the end as Section 2.
-      - Extract the amount that follows 'Adjusted Start Account Balance:'.
-
-    If the markers aren't found, we fall back to using the full financial_report_text
-    and no separate adjusted_start_balance.
+    Find the 'Section 2' chunk and the Adjusted Start Account Balance line.
     """
     lines = financial_report_text.splitlines()
 
@@ -414,16 +362,13 @@ def _extract_section2_from_financial_report(
             break
 
     if adj_idx is None:
-        # No clear Section 2 marker – just return the whole thing.
         section2_text = financial_report_text.strip()
         return section2_text, None
 
-    # Extract adjusted start balance from that line
     adj_line = lines[adj_idx]
     m = re.search(r"Adjusted Start Account Balance:\s*(.+)", adj_line)
     adjusted_start_balance = m.group(1).strip() if m else None
 
-    # Find the previous blank line to mark the start of Section 2
     start_idx = 0
     for j in range(adj_idx - 1, -1, -1):
         if not lines[j].strip():
@@ -439,17 +384,12 @@ def _extract_section2_from_financial_report(
 
     return section2_text, adjusted_start_balance
 
+
 def _format_financial_impact_for_document(section2_text: str) -> str:
     """
-    From the 'Section 2' text of the financial report, build the block for
-    item 11 (Financial Impact):
-
-    - Include lines that describe units (contain 'units:' case-insensitive).
-    - Optionally include 'Total Financial Impact:'.
-    - Include 'Adjusted End Account Balance:'.
-    - Exclude 'Adjusted Start Account Balance:'.
-
-    If we can't find anything meaningful, fall back to the original section2_text.
+    Reduce Section 2 to:
+      - the units lines (PostEASD, Fee Waiver, Total)
+      - the Adjusted End Account Balance
     """
     lines = section2_text.splitlines()
     impact_lines: List[str] = []
@@ -459,39 +399,32 @@ def _format_financial_impact_for_document(section2_text: str) -> str:
         if not stripped:
             continue
 
-        # Skip Adjusted Start
-        if "adjusted start account balance" in stripped.lower():
-            continue
-
         lower = stripped.lower()
 
-        # Unit lines (e.g. 'Fee Waiver units:', 'PostEASD EWID units:')
+        # Exclude Adjusted Start
+        if "adjusted start account balance" in lower:
+            continue
+
+        # Keep unit lines / total / adjusted end
         if "units:" in lower:
             impact_lines.append(stripped)
             continue
 
-        # Total Financial Impact line – keep it, it's still useful
         if stripped.startswith("Total Financial Impact:"):
             impact_lines.append(stripped)
             continue
 
-        # Adjusted End Account Balance – keep this
         if stripped.startswith("Adjusted End Account Balance:"):
             impact_lines.append(stripped)
             continue
 
     if not impact_lines:
-        # Fallback: if for some reason the patterns don't match, keep original
         return section2_text.strip()
 
     return "\n".join(impact_lines)
 
 
 def _format_liability_category(summary: WorkbookUnitSummary) -> str:
-    """
-    Combine liability categories from units in scope.
-    If there's exactly one, use it. If multiple, show them comma-separated.
-    """
     categories = sorted(
         {u.liability_category for u in summary.units if u.liability_category}
     )
@@ -502,54 +435,175 @@ def _format_liability_category(summary: WorkbookUnitSummary) -> str:
     return ", ".join(categories)
 
 
+# -------------------------------------------------------------------
+# Section 12 – positive recommendation logic
+# -------------------------------------------------------------------
+
+
+def _build_positive_recommendation_from_breakdown(
+    bd: FinancialBreakdown,
+) -> str:
+    """
+    Build the positive recommendation string based on:
+      - Fee Waiver total
+      - PostEASD EWID total
+      - Adjusted Start Account Balance
+      - Admin fee
+
+    Rules (your description, implemented):
+
+    - Never add PreEASD EWID (already reversed).
+    - If Fee Waiver AND no PostEASD EWID:
+        Fee Waiver only path.
+    - If PostEASD EWID AND no Fee Waiver:
+        PostEASD only path.
+    - If both Fee Waiver and PostEASD EWID:
+        Combined total path.
+    """
+
+    pre = bd.categories.get(CATEGORY_PRE)
+    post = bd.categories.get(CATEGORY_POST)
+    fee = bd.categories.get(CATEGORY_FEE)
+
+    if pre is None or post is None or fee is None:
+        return (
+            "A positive recommendation cannot be automatically generated because "
+            "the financial breakdown is incomplete. Please review manually."
+        )
+
+    if bd.adjusted_start_balance is None:
+        return (
+            "A positive recommendation cannot be automatically generated because "
+            "the adjusted account balance is unavailable. Please calculate manually."
+        )
+
+    adj = bd.adjusted_start_balance
+    adj_str = _format_currency(adj)
+    if adj > 0:
+        balance_label = "Debt"
+    elif adj < 0:
+        balance_label = "Credit"
+    else:
+        balance_label = "Nil"
+
+    def price_expr(cat) -> str:
+        if not cat.price_counts:
+            return "0 at $0.00"
+        parts: List[str] = []
+        for price in sorted(cat.price_counts.keys()):
+            count = cat.price_counts[price]
+            parts.append(f"{count} at {_format_currency(price)}")
+        return " + ".join(parts)
+
+    fee_units = len(fee.units)
+    post_units = len(post.units)
+
+    fee_total = fee.total
+    post_total = post.total
+
+    admin_str = _format_currency(ADMIN_FEE)
+
+    # Case 1: Fee Waiver only
+    if fee_total > 0 and post_total == 0:
+        base_total = fee_total
+        result = base_total - adj - ADMIN_FEE
+        result_str = _format_currency(result)
+        fee_total_str = _format_currency(base_total)
+        expr = price_expr(fee)
+
+        return (
+            f"Apply Fee Waiver for {fee_units} unit(s) totalling {fee_total_str} "
+            f"({expr}). {fee_total_str} - {adj_str} {balance_label} "
+            f"- {admin_str} Administration Fee = {result_str}."
+        )
+
+    # Case 2: PostEASD EWID only
+    if post_total > 0 and fee_total == 0:
+        base_total = post_total
+        result = base_total - adj - ADMIN_FEE
+        result_str = _format_currency(result)
+        post_total_str = _format_currency(base_total)
+        expr = price_expr(post)
+
+        return (
+            f"Apply PostEASD EWID for {post_units} unit(s) totalling {post_total_str} "
+            f"({expr}). {post_total_str} - {adj_str} {balance_label} "
+            f"- {admin_str} Administration Fee = {result_str}."
+        )
+
+    # Case 3: Both Fee Waiver and PostEASD EWID
+    if fee_total > 0 and post_total > 0:
+        combined = fee_total + post_total
+        combined_str = _format_currency(combined)
+        result = combined - adj - ADMIN_FEE
+        result_str = _format_currency(result)
+        fee_expr = price_expr(fee)
+        post_expr = price_expr(post)
+        fee_total_str = _format_currency(fee_total)
+        post_total_str = _format_currency(post_total)
+
+        return (
+            f"Apply Fee Waiver for {fee_units} unit(s) totalling {fee_total_str} "
+            f"({fee_expr}) and PostEASD EWID for {post_units} unit(s) totalling "
+            f"{post_total_str} ({post_expr}) for a combined total of {combined_str}. "
+            f"{combined_str} - {adj_str} {balance_label} - {admin_str} Administration "
+            f"Fee = {result_str}."
+        )
+
+    # No Fee/Post units
+    return (
+        "No PostEASD EWID or Fee Waiver units are in scope for this recommendation. "
+        "Please review the financial breakdown before proceeding."
+    )
+
+
+def _build_recommendation_text(inputs: SpecialCircumstancesInputs) -> str:
+    """
+    Wrapper for Section 12 – for now we only implement the positive path.
+    Later we can add a negative / no-refund branch when needed.
+    """
+    if inputs.financial_breakdown is None:
+        return (
+            "Recommendation to be completed by the case officer. "
+            "Structured financial data was not available."
+        )
+    return _build_positive_recommendation_from_breakdown(inputs.financial_breakdown)
+
+
+# -------------------------------------------------------------------
+# Build the final investigation document
+# -------------------------------------------------------------------
+
+
 def _build_investigation_document(
     inputs: SpecialCircumstancesInputs,
     ai_analysis_text: str,
 ) -> str:
-    """
-    Build the final investigation document in the strict format requested:
-
-    Hi [leave blank],
-
-    Please find below a COE/refund recommendation for approval:
-    ...
-    """
-
     easd = _get_easd(inputs.workbook_summary)
     application_date_str = _format_date(inputs.date_requested)
     easd_str = _format_date(easd)
-
-    # Liability category derived from the units in scope
     liability_category_str = _format_liability_category(inputs.workbook_summary)
 
-    # Has evidence been supplied:
-    # In the current UI, this function is only called when Special Circumstances
-    # has been checked. So:
-    #   - Yes if any docs uploaded
-    #   - No  if none uploaded
     has_docs = bool(inputs.supporting_document_paths)
     has_evidence_str = "Yes" if has_docs else "No"
 
-    # Extract "Section 2" view and Adjusted Start Account Balance from the
-    # financial report text, where possible.
-    section2_text, adjusted_start_balance = _extract_section2_from_financial_report(
+    # Use the financial report text to derive Section 2 + adjusted start
+    section2_text, adjusted_start_balance_text = _extract_section2_from_financial_report(
         inputs.financial_report_text
     )
 
-    # Account Balance field – prefer Adjusted Start Account Balance from Section 2,
-    # fall back to overall account_balance if available, otherwise N/A.
-    if adjusted_start_balance:
-        account_balance_str = adjusted_start_balance
+    if adjusted_start_balance_text:
+        account_balance_str = adjusted_start_balance_text
     else:
         if inputs.workbook_summary.account_balance is not None:
             bal = inputs.workbook_summary.account_balance
-            # Format similar to the financial report (no thousands commas)
-            sign = "-" if bal < 0 else ""
-            account_balance_str = f"{sign}${abs(bal):.2f}"
+            account_balance_str = _format_currency(bal)
         else:
             account_balance_str = "N/A"
 
-    # Build the strict template
+    impact_block = _format_financial_impact_for_document(section2_text)
+    recommendation_text = _build_recommendation_text(inputs)
+
     lines: List[str] = []
 
     lines.append("Hi ,")
@@ -557,7 +611,7 @@ def _build_investigation_document(
     lines.append("Please find below a COE/refund recommendation for approval:")
     lines.append("")
     lines.append("1. Course Code and Name: ")
-    lines.append(f"")
+    lines.append("")
     lines.append(f"2. Liability Category: {liability_category_str}")
     lines.append("")
     lines.append("3. Citizenship: ")
@@ -572,19 +626,22 @@ def _build_investigation_document(
     lines.append("")
     lines.append(ai_analysis_text.strip())
     lines.append("")
-    lines.append(f"8. Has evidence been supplied: {has_evidence_str} ")
+    lines.append(
+        f"8. Has evidence been supplied: {has_evidence_str} "
+        "(If Special Circumstances was not selected, this should be recorded as 'NA'.)"
+    )
     lines.append("")
     lines.append("9. AHPRA Verified?: ")
     lines.append("")
     lines.append(f"10. Account Balance: {account_balance_str}")
     lines.append("")
-    impact_block = _format_financial_impact_for_document(section2_text)
-
     lines.append("11. Financial Impact:")
     lines.append("")
     lines.append(impact_block)
     lines.append("")
-    lines.append("12. Recommendation: ")
+    lines.append("12. Recommendation:")
+    lines.append("")
+    lines.append(recommendation_text)
     lines.append("")
     lines.append(
         "By sending through this request, I acknowledge that I am aware of "
@@ -611,42 +668,21 @@ def generate_special_circumstances_report(
     instructions_path: Optional[Path] = None,
     model: Optional[str] = None,
 ) -> SpecialCircumstancesResult:
-    """
-    Generate a Special Circumstances Investigation Report by calling OpenAI
-    with both text and supporting documents (images + extracted text).
-
-    - Reads instructions.txt (which you can keep updating).
-    - Uses the workbook summary + financial report + supporting docs.
-    - Asks the model to:
-        * Infer the Reason for COE from the provided options.
-        * Assess special circumstances against TAFE Queensland criteria.
-        * Build a timeline of events starting at the EASD.
-        * Provide a short impact summary.
-
-    The AI output is then embedded into a strict, TAFE-style template to form
-    the final document that you paste into your internal system.
-    """
-
     instructions_text = _load_instructions_text(instructions_path)
     case_text = _build_case_text_payload(inputs)
 
-    # Split documents for images and text
     images, txts, docxs, pdfs = _split_docs_by_type(inputs.supporting_document_paths)
 
-    # Convert each PDF to one or more page images for the vision model
     pdf_image_paths: List[Path] = []
     for pdf in pdfs:
         try:
             page_images = convert_pdf_to_images(pdf)
             pdf_image_paths.extend(page_images)
         except Exception:
-            # If conversion fails, we just skip images for that PDF
             continue
 
-    # Combine original images + PDF-derived images
     all_image_paths: List[Path] = list(images) + list(pdf_image_paths)
 
-    # Build the multimodal content list for the 'user' message
     user_content: List[dict] = [
         {
             "type": "text",
@@ -675,7 +711,6 @@ def generate_special_circumstances_report(
         }
     ]
 
-    # Attach each image document for the vision model (PNG/JPEG + PDF pages)
     for path in all_image_paths:
         data_url = _encode_image_to_data_url(path)
         if not data_url:
@@ -714,18 +749,16 @@ def generate_special_circumstances_report(
         },
     ]
 
-    client = OpenAI()  # Uses OPENAI_API_KEY from environment by default
+    client = OpenAI()
     model_id = model or DEFAULT_MODEL
 
     response = client.chat.completions.create(
         model=model_id,
         messages=messages,
-        temperature=0.2,  # keep it precise and policy-aligned
+        temperature=0.2,
     )
 
     ai_analysis_text = response.choices[0].message.content.strip()
-
-    # Wrap the AI analysis into the strict 1–12 template
     final_doc = _build_investigation_document(
         inputs=inputs,
         ai_analysis_text=ai_analysis_text,
