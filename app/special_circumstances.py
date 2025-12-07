@@ -572,10 +572,7 @@ def _build_investigation_document(
     lines.append("")
     lines.append(ai_analysis_text.strip())
     lines.append("")
-    lines.append(
-        f"8. Has evidence been supplied: {has_evidence_str} "
-        "(If Special Circumstances was not selected, this should be recorded as 'NA'.)"
-    )
+    lines.append(f"8. Has evidence been supplied: {has_evidence_str} ")
     lines.append("")
     lines.append("9. AHPRA Verified?: ")
     lines.append("")
