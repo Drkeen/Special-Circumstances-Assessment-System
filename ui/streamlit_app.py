@@ -26,7 +26,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from app.excel_reader import load_unit_summary_from_files
-from app.financial_report import generate_financial_report_text
+from app.financial_report import generate_financial_report, FinancialBreakdown
 from app.models import WorkbookUnitSummary
 from app.special_circumstances import (
     SpecialCircumstancesInputs,
@@ -307,13 +307,17 @@ st.markdown("---")
 st.subheader("Step 3 – Financial Report")
 
 report_text: Optional[str] = None
+financial_breakdown: Optional[FinancialBreakdown] = None
 
 if date_requested is None:
     st.info("Enter a valid Date Requested in the sidebar to generate the financial report.")
 elif scope == "Specific Units" and not report_units:
     st.info("Select at least one row in the Unit Summary to generate the financial report.")
 else:
-    report_text = generate_financial_report_text(report_summary, date_requested)
+    report_text, financial_breakdown = generate_financial_report(
+        report_summary,
+        date_requested,
+    )
     st.code(report_text, language="text")
 
 # -------------------------------------------------
@@ -375,13 +379,14 @@ if sc_enabled:
                     financial_report_text=report_text,
                     supporting_document_paths=support_paths,
                     case_officer_notes=notes or None,
-                    # These can be wired to extra UI fields later if needed
                     student_name=None,
                     student_number=None,
                     program_name=None,
                     campus=None,
                     study_period_description=None,
+                    financial_breakdown=financial_breakdown,
                 )
+
 
                 try:
                     result = generate_special_circumstances_report(inputs)
