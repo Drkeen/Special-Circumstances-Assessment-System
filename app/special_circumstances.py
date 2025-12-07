@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -12,7 +13,7 @@ from decimal import Decimal
 from openai import OpenAI
 
 from .models import WorkbookUnitSummary, UnitSummaryRow
-from .pdf_to_images import convert_pdf_to_images  # NEW: PDF → image converter
+from .pdf_to_images import convert_pdf_to_images  # PDF → image converter
 
 # -------------------------------------------------------------------
 # Configuration
@@ -120,7 +121,6 @@ def _format_units_block(units: List[UnitSummaryRow]) -> str:
         price_str = f"${price:.2f}" if price is not None else "N/A"
         hours_str = f"{u.recorded_hours:.2f}" if u.recorded_hours is not None else "N/A"
 
-        # NEW: latest engagement date (may be None)
         latest_eng = getattr(u, "latest_engagement_date", None)
         latest_str = _format_date(latest_eng) if latest_eng else "N/A"
 
@@ -386,6 +386,175 @@ account balances, but do NOT recalculate the dollar amounts.
 
 
 # -------------------------------------------------------------------
+# Helpers – financial report post-processing
+# -------------------------------------------------------------------
+
+
+def _extract_section2_from_financial_report(
+    financial_report_text: str,
+) -> tuple[str, Optional[str]]:
+    """
+    Best-effort extraction of the 'Section 2' view (after PreEASD EWID reversals)
+    and its Adjusted Start Account Balance from the financial report text.
+
+    Current heuristic:
+      - Look for a line starting with 'Adjusted Start Account Balance:'.
+      - Take the block from the previous blank line up to the end as Section 2.
+      - Extract the amount that follows 'Adjusted Start Account Balance:'.
+
+    If the markers aren't found, we fall back to using the full financial_report_text
+    and no separate adjusted_start_balance.
+    """
+    lines = financial_report_text.splitlines()
+
+    adj_idx: Optional[int] = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("Adjusted Start Account Balance:"):
+            adj_idx = i
+            break
+
+    if adj_idx is None:
+        # No clear Section 2 marker – just return the whole thing.
+        section2_text = financial_report_text.strip()
+        return section2_text, None
+
+    # Extract adjusted start balance from that line
+    adj_line = lines[adj_idx]
+    m = re.search(r"Adjusted Start Account Balance:\s*(.+)", adj_line)
+    adjusted_start_balance = m.group(1).strip() if m else None
+
+    # Find the previous blank line to mark the start of Section 2
+    start_idx = 0
+    for j in range(adj_idx - 1, -1, -1):
+        if not lines[j].strip():
+            start_idx = j + 1
+            break
+        if j == 0:
+            start_idx = 0
+
+    section2_lines = lines[start_idx:]
+    section2_text = "\n".join(section2_lines).strip()
+    if not section2_text:
+        section2_text = financial_report_text.strip()
+
+    return section2_text, adjusted_start_balance
+
+
+def _format_liability_category(summary: WorkbookUnitSummary) -> str:
+    """
+    Combine liability categories from units in scope.
+    If there's exactly one, use it. If multiple, show them comma-separated.
+    """
+    categories = sorted(
+        {u.liability_category for u in summary.units if u.liability_category}
+    )
+    if not categories:
+        return "N/A"
+    if len(categories) == 1:
+        return categories[0]
+    return ", ".join(categories)
+
+
+def _build_investigation_document(
+    inputs: SpecialCircumstancesInputs,
+    ai_analysis_text: str,
+) -> str:
+    """
+    Build the final investigation document in the strict format requested:
+
+    Hi [leave blank],
+
+    Please find below a COE/refund recommendation for approval:
+    ...
+    """
+
+    easd = _get_easd(inputs.workbook_summary)
+    application_date_str = _format_date(inputs.date_requested)
+    easd_str = _format_date(easd)
+
+    # Liability category derived from the units in scope
+    liability_category_str = _format_liability_category(inputs.workbook_summary)
+
+    # Has evidence been supplied:
+    # In the current UI, this function is only called when Special Circumstances
+    # has been checked. So:
+    #   - Yes if any docs uploaded
+    #   - No  if none uploaded
+    has_docs = bool(inputs.supporting_document_paths)
+    has_evidence_str = "Yes" if has_docs else "No"
+
+    # Extract "Section 2" view and Adjusted Start Account Balance from the
+    # financial report text, where possible.
+    section2_text, adjusted_start_balance = _extract_section2_from_financial_report(
+        inputs.financial_report_text
+    )
+
+    # Account Balance field – prefer Adjusted Start Account Balance from Section 2,
+    # fall back to overall account_balance if available, otherwise N/A.
+    if adjusted_start_balance:
+        account_balance_str = adjusted_start_balance
+    else:
+        if inputs.workbook_summary.account_balance is not None:
+            bal = inputs.workbook_summary.account_balance
+            # Format similar to the financial report (no thousands commas)
+            sign = "-" if bal < 0 else ""
+            account_balance_str = f"{sign}${abs(bal):.2f}"
+        else:
+            account_balance_str = "N/A"
+
+    # Build the strict template
+    lines: List[str] = []
+
+    lines.append("Hi ,")
+    lines.append("")
+    lines.append("Please find below a COE/refund recommendation for approval:")
+    lines.append("")
+    lines.append("1. Course Code and Name: ")
+    lines.append(f"")
+    lines.append(f"2. Liability Category: {liability_category_str}")
+    lines.append("")
+    lines.append("3. Citizenship: ")
+    lines.append("")
+    lines.append(f"4. Application date: {application_date_str}")
+    lines.append("")
+    lines.append(f"5. EASD: {easd_str}")
+    lines.append("")
+    lines.append("6. Census Date: ")
+    lines.append("")
+    lines.append("7. Reason for COE:")
+    lines.append("")
+    lines.append(ai_analysis_text.strip())
+    lines.append("")
+    lines.append(
+        f"8. Has evidence been supplied: {has_evidence_str} "
+        "(If Special Circumstances was not selected, this should be recorded as 'NA'.)"
+    )
+    lines.append("")
+    lines.append("9. AHPRA Verified?: ")
+    lines.append("")
+    lines.append(f"10. Account Balance: {account_balance_str}")
+    lines.append("")
+    lines.append("11. Financial Impact:")
+    lines.append("")
+    lines.append(section2_text.strip())
+    lines.append("")
+    lines.append("12. Recommendation: ")
+    lines.append("")
+    lines.append(
+        "By sending through this request, I acknowledge that I am aware of "
+        "TAFE Queensland Procedure 650 Student Fees, the TAFE Queensland Financial "
+        "Management Delegations and will be processing the above transaction in SMS "
+        "as per the FACT SHEET - Fee Waivers, Reversals and Overrides"
+    )
+    lines.append(" ")
+    lines.append("Kind regards,")
+    lines.append("")
+    lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
+# -------------------------------------------------------------------
 # Main entry point
 # -------------------------------------------------------------------
 
@@ -408,8 +577,8 @@ def generate_special_circumstances_report(
         * Build a timeline of events starting at the EASD.
         * Provide a short impact summary.
 
-    Returns:
-      SpecialCircumstancesResult(report_text=...)
+    The AI output is then embedded into a strict, TAFE-style template to form
+    the final document that you paste into your internal system.
     """
 
     instructions_text = _load_instructions_text(instructions_path)
@@ -418,7 +587,7 @@ def generate_special_circumstances_report(
     # Split documents for images and text
     images, txts, docxs, pdfs = _split_docs_by_type(inputs.supporting_document_paths)
 
-    # NEW: convert each PDF to one or more page images for the vision model
+    # Convert each PDF to one or more page images for the vision model
     pdf_image_paths: List[Path] = []
     for pdf in pdfs:
         try:
@@ -452,6 +621,8 @@ def generate_special_circumstances_report(
                 "   and withdrawal request date.\n"
                 "4. Provide a short IMPACT SUMMARY focusing on the relevant study period.\n"
                 "5. Do NOT make an explicit approval/refusal decision – your role is analysis only.\n\n"
+                "Return your analysis as a concise but complete narrative, suitable to be placed "
+                "under the heading 'Reason for COE' in an internal recommendation document.\n\n"
                 "CASE DATA (TEXTUAL SUMMARY):\n\n"
                 f"{case_text}"
             ),
@@ -478,8 +649,8 @@ def generate_special_circumstances_report(
             "content": (
                 "You are an experienced TAFE Queensland case officer. "
                 "You write clear, professional, and concise Special Circumstances "
-                "Investigation Reports that will be pasted into an internal system. "
-                "Use Australian English and date format dd/mm/yyyy."
+                "Investigation analyses that will be inserted into a structured "
+                "internal template. Use Australian English and date format dd/mm/yyyy."
             ),
         },
         {
@@ -506,6 +677,12 @@ def generate_special_circumstances_report(
         temperature=0.2,  # keep it precise and policy-aligned
     )
 
-    report_text = response.choices[0].message.content.strip()
+    ai_analysis_text = response.choices[0].message.content.strip()
 
-    return SpecialCircumstancesResult(report_text=report_text)
+    # Wrap the AI analysis into the strict 1–12 template
+    final_doc = _build_investigation_document(
+        inputs=inputs,
+        ai_analysis_text=ai_analysis_text,
+    )
+
+    return SpecialCircumstancesResult(report_text=final_doc)
