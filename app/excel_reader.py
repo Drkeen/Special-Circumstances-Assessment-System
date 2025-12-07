@@ -355,6 +355,7 @@ def build_unit_summary(
         account_balance = total_unalloc
 
     # Build the summary rows (Study Plan is the driver)
+    # Build the summary rows (Study Plan is the driver)
     summary_rows: List[UnitSummaryRow] = []
     for sp in study_plan:
         key = (sp.unit_code, sp.start_date)
@@ -362,10 +363,13 @@ def build_unit_summary(
         account = price_map.get(sp.unit_code)
 
         recorded_hours = engagement.recorded_hours if engagement else None
-        unit_price = account.txn_amount if account else None
-        latest_engagement_date = (
-            engagement.latest_engagement_date if engagement else None
-        )
+
+        # Take the txn_amount as the "unit price", but ensure it is never negative.
+        unit_price = None
+        if account is not None and account.txn_amount is not None:
+            unit_price = account.txn_amount
+            if unit_price < 0:
+                unit_price = -unit_price  # normalise to positive
 
         summary_rows.append(
             UnitSummaryRow(
@@ -375,11 +379,11 @@ def build_unit_summary(
                 recorded_hours=recorded_hours,
                 unit_price=unit_price,
                 liability_category=sp.liability_category,
-                latest_engagement_date=latest_engagement_date,  # NEW: carried through
             )
         )
 
     return WorkbookUnitSummary(units=summary_rows, account_balance=account_balance)
+
 
 
 # -----------------------------
