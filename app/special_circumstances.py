@@ -439,6 +439,53 @@ def _extract_section2_from_financial_report(
 
     return section2_text, adjusted_start_balance
 
+def _format_financial_impact_for_document(section2_text: str) -> str:
+    """
+    From the 'Section 2' text of the financial report, build the block for
+    item 11 (Financial Impact):
+
+    - Include lines that describe units (contain 'units:' case-insensitive).
+    - Optionally include 'Total Financial Impact:'.
+    - Include 'Adjusted End Account Balance:'.
+    - Exclude 'Adjusted Start Account Balance:'.
+
+    If we can't find anything meaningful, fall back to the original section2_text.
+    """
+    lines = section2_text.splitlines()
+    impact_lines: List[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Skip Adjusted Start
+        if "adjusted start account balance" in stripped.lower():
+            continue
+
+        lower = stripped.lower()
+
+        # Unit lines (e.g. 'Fee Waiver units:', 'PostEASD EWID units:')
+        if "units:" in lower:
+            impact_lines.append(stripped)
+            continue
+
+        # Total Financial Impact line – keep it, it's still useful
+        if stripped.startswith("Total Financial Impact:"):
+            impact_lines.append(stripped)
+            continue
+
+        # Adjusted End Account Balance – keep this
+        if stripped.startswith("Adjusted End Account Balance:"):
+            impact_lines.append(stripped)
+            continue
+
+    if not impact_lines:
+        # Fallback: if for some reason the patterns don't match, keep original
+        return section2_text.strip()
+
+    return "\n".join(impact_lines)
+
 
 def _format_liability_category(summary: WorkbookUnitSummary) -> str:
     """
@@ -534,9 +581,11 @@ def _build_investigation_document(
     lines.append("")
     lines.append(f"10. Account Balance: {account_balance_str}")
     lines.append("")
+    impact_block = _format_financial_impact_for_document(section2_text)
+
     lines.append("11. Financial Impact:")
     lines.append("")
-    lines.append(section2_text.strip())
+    lines.append(impact_block)
     lines.append("")
     lines.append("12. Recommendation: ")
     lines.append("")
