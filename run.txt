@@ -1,0 +1,10 @@
+# ==== Special Circumstances Assessment System ====
+# How to activate venv and run Streamlit
+
+python -m pip install -r requirements.txt
+
+.\.venv\Scripts\activate.bat
+
+streamlit run ui\streamlit_app.py
+
+deactivate

@@ -1,3 +1,5 @@
+Excel reading and dataclasses
+
 Alright, lets setup the project to give as the output the we want for now, we may have to adjust classes and functions. I want the final output from all three data sheets to be held into one dataclass and tabled, here is the general breakdown of the data we want:
 
 Study Plan: This sheets hold only relevant data, so we will use it as the main sheets to crosscheck our other data to.
@@ -22,3 +24,7 @@ Txn Amt: we just want to find one relevant instance of the unit price for later 
 Ideally, we then create a class with this data that would look similar to the 'Study Plan' sheet except it only has the data we want. Outputting the data into a table should look something like:
 
 | Unit Code | Unit Status | Unit Start Date | Unit Recorded Hours | Unit Price |
+
+
+Financial Report:
+Great. I am happy with the result of our excel_reader.py and our models seem to be working correctly too. Now, let's move onto the next section of the project - the Financial Report. This should be in a new file. We already have all the data that we need to generate the report from our WorkbookUnitSummary class. We just need to generate a text report that is formatted exaclty how we want it. The formatting can be quite complicated, so we can build it slowly. Let's start with the easy parts:
