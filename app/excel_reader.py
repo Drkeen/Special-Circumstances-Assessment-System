@@ -175,48 +175,62 @@ def parse_study_plan(df: pd.DataFrame) -> List[StudyPlanRow]:
 def parse_unit_engagement(df: pd.DataFrame) -> List[UnitEngagementRow]:
     """
     Unit Engagement:
-      - Curriculum Item     -> unit code
-      - Unit Start Date     -> start date
-      - Recorded hours      -> float
-
-    Column names can vary slightly between exports (e.g. 'Recorded Hours'
-    vs 'Recorded hours'), so we detect the recorded-hours column
-    from a list of candidates.
+      - Curriculum Item              -> unit code
+      - Unit Start Date              -> start date
+      - Recorded hours / Recorded Hours -> float
+      - Latest Engagement Date (optional) -> date
     """
-    # Required fixed columns by name (order does NOT matter)
-    unit_code_col = "Curriculum Item"
-    start_date_col = "Unit Start Date"
 
-    base_missing = [c for c in [unit_code_col, start_date_col] if c not in df.columns]
-    if base_missing:
-        raise ValueError(f"Unit Engagement sheet missing columns: {base_missing}")
+    def find_col(normalised_targets):
+        """
+        Given a list of target names like ["recorded hours"],
+        find the first column whose stripped, lowercased name matches.
+        """
+        targets = {t.strip().lower() for t in normalised_targets}
+        for c in df.columns:
+            if str(c).strip().lower() in targets:
+                return c
+        return None
 
-    # Recorded hours can have a few different spellings between reports
-    recorded_candidates = [
-        "Recorded hours",
-        "Recorded Hours",
-        "TotalEngagementHoursSummary",
-        "Total Engagement Hours",
-        "Total Engagement Hours Summary",
-    ]
-    recorded_col = next((c for c in recorded_candidates if c in df.columns), None)
-    if recorded_col is None:
-        raise ValueError(
-            f"Unit Engagement sheet missing a recognised 'recorded hours' column. "
-            f"Tried: {recorded_candidates}. Actual columns: {list(df.columns)}"
-        )
+    # Required core columns
+    curriculum_col = find_col(["curriculum item"])
+    start_col = find_col(["unit start date"])
+    if curriculum_col is None or start_col is None:
+        missing = []
+        if curriculum_col is None:
+            missing.append("Curriculum Item")
+        if start_col is None:
+            missing.append("Unit Start Date")
+        raise ValueError(f"Unit Engagement sheet missing columns: {missing}")
+
+    # Recorded hours (we expect it, but match flexibly)
+    hours_col = find_col(["recorded hours"])
+
+    # Latest Engagement Date (optional)
+    latest_engagement_col = find_col(["latest engagement date"])
 
     rows: List[UnitEngagementRow] = []
     for _, row in df.iterrows():
-        start = _to_date(row[start_date_col])
+        start = _to_date(row[start_col])
         if start is None:
             continue
 
+        recorded_hours = (
+            _parse_recorded_hours(row[hours_col]) if hours_col is not None else None
+        )
+
+        latest_engagement = (
+            _to_date(row[latest_engagement_col])
+            if latest_engagement_col is not None
+            else None
+        )
+
         rows.append(
             UnitEngagementRow(
-                unit_code=str(row[unit_code_col]).strip(),
+                unit_code=str(row[curriculum_col]).strip(),
                 start_date=start,
-                recorded_hours=_parse_recorded_hours(row[recorded_col]),
+                recorded_hours=recorded_hours,
+                latest_engagement_date=latest_engagement,
             )
         )
 
@@ -334,8 +348,8 @@ def build_unit_summary(
     total_unalloc = Decimal("0")
     has_unalloc = False
     for sa in student_account:
-        if sa.unalloc_amt is not None:
-            total_unalloc += sa.unalloc_amt
+        if getattr(sa, "unalloc_amt", None) is not None:
+            total_unalloc += sa.unalloc_amt  # type: ignore[arg-type]
             has_unalloc = True
     if has_unalloc:
         account_balance = total_unalloc
@@ -349,6 +363,9 @@ def build_unit_summary(
 
         recorded_hours = engagement.recorded_hours if engagement else None
         unit_price = account.txn_amount if account else None
+        latest_engagement_date = (
+            engagement.latest_engagement_date if engagement else None
+        )
 
         summary_rows.append(
             UnitSummaryRow(
@@ -358,6 +375,7 @@ def build_unit_summary(
                 recorded_hours=recorded_hours,
                 unit_price=unit_price,
                 liability_category=sp.liability_category,
+                latest_engagement_date=latest_engagement_date,  # NEW: carried through
             )
         )
 

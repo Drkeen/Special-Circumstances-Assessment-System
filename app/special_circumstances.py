@@ -109,7 +109,7 @@ def _format_units_block(units: List[UnitSummaryRow]) -> str:
     Format the units into a simple text block for the LLM.
 
     Each line looks like:
-      ACMGEN301 | Status: Enrolled | Start: 14/07/2025 | Hours: 50.0 | Price: $527.00 | Liability: VFH
+      ACMGEN301 | Status: Enrolled | Start: 14/07/2025 | Latest engagement: 20/08/2025 | Hours: 50.0 | Price: $527.00 | Liability: VFH
     """
     if not units:
         return "No units in scope for this assessment."
@@ -119,9 +119,15 @@ def _format_units_block(units: List[UnitSummaryRow]) -> str:
         price: Optional[Decimal] = u.unit_price
         price_str = f"${price:.2f}" if price is not None else "N/A"
         hours_str = f"{u.recorded_hours:.2f}" if u.recorded_hours is not None else "N/A"
+
+        # NEW: latest engagement date (may be None)
+        latest_eng = getattr(u, "latest_engagement_date", None)
+        latest_str = _format_date(latest_eng) if latest_eng else "N/A"
+
         lines.append(
             f"{u.unit_code} | Status: {u.status} | Start: {_format_date(u.start_date)} | "
-            f"Recorded hours: {hours_str} | Price: {price_str} | Liability: {u.liability_category}"
+            f"Latest engagement: {latest_str} | Recorded hours: {hours_str} | "
+            f"Price: {price_str} | Liability: {u.liability_category}"
         )
     return "\n".join(lines)
 

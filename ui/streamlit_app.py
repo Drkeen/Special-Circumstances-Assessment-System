@@ -4,9 +4,18 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 from datetime import datetime, date
+from typing import Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
+
+# Optional: load .env if python-dotenv is installed
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
 
 # -------------------------------------------------
 # Make sure the project root is on sys.path so that
@@ -25,28 +34,20 @@ from app.special_circumstances import (
 )
 
 SAMPLE_DIR = BASE_DIR / "sample_data"
+UPLOAD_SPREADSHEET_DIR = BASE_DIR / "uploaded_spreadsheets"
+UPLOAD_SUPPORT_DIR = BASE_DIR / "uploaded_supporting_docs"
 
-st.set_page_config(page_title="SCAS Sample Data Viewer", layout="wide")
+UPLOAD_SPREADSHEET_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-st.title("Special Circumstances Assessment System – Sample Data Test")
+st.set_page_config(page_title="SCAS – Special Circumstances Assessment", layout="wide")
 
-# Sidebar: choose which sample student
-student_choice = st.sidebar.selectbox(
-    "Select sample dataset",
-    ["student_a", "student_b", "student_c"],
-    index=0,
-)
+st.title("Special Circumstances Assessment System (SCAS)")
 
-data_dir = SAMPLE_DIR / student_choice / "data"
+# -------------------------------------------------
+# Sidebar – Date Requested + data source choice
+# -------------------------------------------------
 
-study_plan_path = data_dir / "study_plan.xlsx"
-unit_engagement_path = data_dir / "unit_engagement.xlsx"
-student_account_path = data_dir / "student_account.xlsx"
-
-st.sidebar.write("Data folder:", f"`{data_dir}`")
-
-# Sidebar: Date Requested (application date)
-st.sidebar.markdown("---")
 st.sidebar.subheader("Application Date")
 
 date_str = st.sidebar.text_input(
@@ -54,33 +55,177 @@ date_str = st.sidebar.text_input(
     placeholder="e.g. 11/12/2025",
 )
 
-date_requested: date | None = None
+date_requested: Optional[date] = None
 if date_str.strip():
     try:
         date_requested = datetime.strptime(date_str.strip(), "%d/%m/%Y").date()
     except ValueError:
         st.sidebar.error("Please enter a valid date in dd/mm/yyyy format.")
 
-# Check files exist
-missing_files = [
-    p for p in [study_plan_path, unit_engagement_path, student_account_path] if not p.exists()
-]
+st.sidebar.markdown("---")
+data_source = st.sidebar.radio(
+    "Data source",
+    ["Sample data (demo)", "Upload spreadsheets"],
+    index=0,
+)
 
-if missing_files:
-    st.error(f"Missing files: {', '.join(str(p.name) for p in missing_files)}")
-    st.stop()
+# -------------------------------------------------
+# Determine file paths based on data source
+# -------------------------------------------------
 
-# Load & merge (full workbook summary)
+study_plan_path: Optional[Path] = None
+unit_engagement_path: Optional[Path] = None
+student_account_path: Optional[Path] = None
+
+def classify_excel_file(temp_path: Path) -> Optional[str]:
+    """
+    Classify an Excel file as 'study_plan', 'unit_engagement', 'student_account', or None
+    based on header markers found in the first few rows.
+    """
+    try:
+        preview = pd.read_excel(temp_path, nrows=10, header=None, engine="openpyxl")
+    except Exception:
+        return None
+
+    text_cells: List[str] = [
+        str(v) for v in preview.values.ravel() if not pd.isna(v)
+    ]
+    lower_cells = [s.lower() for s in text_cells]
+
+    def score_for(markers: List[str]) -> int:
+        score = 0
+        for m in markers:
+            m_low = m.lower()
+            if any(m_low in cell for cell in lower_cells):
+                score += 1
+        return score
+
+    scores: Dict[str, int] = {
+        "study_plan": score_for(["Spk Cd", "SSP Status", "Enrolment Activity Start Date"]),
+        "unit_engagement": score_for(["Curriculum Item", "Unit Start Date", "Recorded"]),
+        "student_account": score_for(["SSP Spk Cd", "Txn Amt", "Txb Amt", "Unalloc Amt"]),
+    }
+
+    best_type = max(scores, key=scores.get)
+    if scores[best_type] == 0:
+        return None
+    return best_type
+
+
+if data_source == "Sample data (demo)":
+    # Choose which sample dataset
+    student_choice = st.sidebar.selectbox(
+        "Select sample dataset",
+        ["student_a", "student_b", "student_c"],
+        index=0,
+    )
+
+    data_dir = SAMPLE_DIR / student_choice / "data"
+    st.sidebar.write("Data folder:", f"`{data_dir}`")
+
+    study_plan_path = data_dir / "study_plan.xlsx"
+    unit_engagement_path = data_dir / "unit_engagement.xlsx"
+    student_account_path = data_dir / "student_account.xlsx"
+
+    missing_files = [
+        p
+        for p in [study_plan_path, unit_engagement_path, student_account_path]
+        if not p.exists()
+    ]
+    if missing_files:
+        st.error(
+            "Missing sample files: "
+            + ", ".join(str(p.name) for p in missing_files)
+        )
+        st.stop()
+
+else:
+    st.markdown("### Step 1 – Upload TechOne Spreadsheets")
+    st.write(
+        "Upload the three Excel exports for this student:\n"
+        "- Study Plan\n"
+        "- Unit Engagement\n"
+        "- Student Account\n\n"
+        "**Tip:** You can drag-and-drop all three files at once."
+    )
+
+    uploaded_sheets = st.file_uploader(
+        "Upload the 3 spreadsheets (.xlsx)",
+        type=["xlsx"],
+        accept_multiple_files=True,
+    )
+
+    if not uploaded_sheets:
+        st.info("Please upload the three Excel files to proceed.")
+        st.stop()
+
+    # Save and classify uploaded spreadsheets
+    detected_paths: Dict[str, Path] = {}
+    classification_messages: List[str] = []
+
+    for f in uploaded_sheets:
+        # Save to disk
+        target_path = UPLOAD_SPREADSHEET_DIR / f.name
+        target_path.write_bytes(f.getbuffer())
+
+        sheet_type = classify_excel_file(target_path)
+        classification_messages.append(
+            f"- `{f.name}` → {sheet_type or 'UNKNOWN'}"
+        )
+
+        if sheet_type is None:
+            continue
+
+        if sheet_type in detected_paths:
+            # Duplicate type – that's a problem
+            st.error(
+                f"Detected more than one file for '{sheet_type}'.\n\n"
+                "Detected so far:\n"
+                + "\n".join(classification_messages)
+            )
+            st.stop()
+
+        detected_paths[sheet_type] = target_path
+
+    st.markdown("**Detected file types:**")
+    st.markdown("\n".join(classification_messages))
+
+    # Ensure we have each required type exactly once
+    required_types = ["study_plan", "unit_engagement", "student_account"]
+    missing_types = [t for t in required_types if t not in detected_paths]
+
+    if missing_types:
+        st.error(
+            "The following required sheet types were not detected: "
+            + ", ".join(missing_types)
+            + ".\n\nPlease check that you've uploaded the correct TechOne exports."
+        )
+        st.stop()
+
+    study_plan_path = detected_paths["study_plan"]
+    unit_engagement_path = detected_paths["unit_engagement"]
+    student_account_path = detected_paths["student_account"]
+
+# At this point, we have valid paths for all three spreadsheets
+assert study_plan_path is not None
+assert unit_engagement_path is not None
+assert student_account_path is not None
+
+# -------------------------------------------------
+# Load & merge into WorkbookUnitSummary
+# -------------------------------------------------
+
 summary = load_unit_summary_from_files(
     study_plan_path=study_plan_path,
     unit_engagement_path=unit_engagement_path,
     student_account_path=student_account_path,
 )
 
-# ---------------------------------
-# Scope selection (main area)
-# ---------------------------------
-st.markdown("### Scope")
+# -------------------------------------------------
+# Scope selection + Unit Summary table
+# -------------------------------------------------
+
+st.markdown("### Step 2 – Scope of Withdrawal")
 scope = st.radio(
     "What is the student withdrawing from?",
     ["Full Course", "Specific Units"],
@@ -88,9 +233,7 @@ scope = st.radio(
     horizontal=True,
 )
 
-# ---------------------------------
 # Build full Unit Summary DataFrame (all units)
-# ---------------------------------
 rows_for_table_all = []
 for u in summary.units:
     if date_requested is not None:
@@ -108,16 +251,19 @@ for u in summary.units:
             "Unit Recorded Hours": u.recorded_hours,
             "Unit Price": float(u.unit_price) if u.unit_price is not None else None,
             "Liability Category": u.liability_category,
+            "Latest Engagement Date": u.latest_engagement_date,
         }
     )
 
 df_full = pd.DataFrame(rows_for_table_all)
 
-st.subheader(f"Unit Summary – {student_choice}")
+if data_source == "Sample data (demo)":
+    current_case_label = f"Sample dataset – {student_choice}"
+else:
+    current_case_label = "Uploaded spreadsheets"
 
-# ---------------------------------
-# Show table & capture selection
-# ---------------------------------
+st.subheader(f"Unit Summary ({current_case_label})")
+
 if scope == "Full Course":
     st.caption("All units are included in this financial assessment.")
     # Read-only table, no selection needed
@@ -129,7 +275,6 @@ else:
         "Selected units will be used to calculate the financial impact."
     )
 
-    # st.dataframe with row selection and built-in highlight
     event = st.dataframe(
         df_full,
         use_container_width=True,
@@ -138,8 +283,7 @@ else:
         selection_mode="multi-row",
     )
 
-    # Get selected row indices (if any)
-    selected_rows = []
+    selected_rows: List[int] = []
     if hasattr(event, "selection") and hasattr(event.selection, "rows"):
         selected_rows = event.selection.rows
 
@@ -155,13 +299,14 @@ report_summary = WorkbookUnitSummary(
     account_balance=summary.account_balance,
 )
 
-# -----------------------------
-# Financial report section
-# -----------------------------
-st.markdown("---")
-st.subheader("Financial Report")
+# -------------------------------------------------
+# Financial report
+# -------------------------------------------------
 
-report_text: str | None = None
+st.markdown("---")
+st.subheader("Step 3 – Financial Report")
+
+report_text: Optional[str] = None
 
 if date_requested is None:
     st.info("Enter a valid Date Requested in the sidebar to generate the financial report.")
@@ -171,65 +316,66 @@ else:
     report_text = generate_financial_report_text(report_summary, date_requested)
     st.code(report_text, language="text")
 
-# -----------------------------
-# Special Circumstances section
-# -----------------------------
+# -------------------------------------------------
+# Special Circumstances Investigation Report
+# -------------------------------------------------
+
 st.markdown("---")
 sc_enabled = st.checkbox("Generate Special Circumstances Investigation Report")
 
 if sc_enabled:
-    st.subheader("Special Circumstances Investigation Report")
+    st.subheader("Step 4 – Special Circumstances Investigation Report")
 
     if date_requested is None:
         st.warning("Please enter a valid Date Requested first.")
     elif report_text is None:
         st.warning("Please generate the Financial Report first (see section above).")
     else:
-        # Locate supporting_documents for this student
-        support_dir = SAMPLE_DIR / student_choice / "supporting_documents"
-        support_files: list[Path] = []
-        if support_dir.exists() and support_dir.is_dir():
-            for p in support_dir.iterdir():
-                if p.is_file() and p.suffix.lower() in {
-                    ".png",
-                    ".jpg",
-                    ".jpeg",
-                    ".pdf",
-                    ".txt",
-                    ".docx",
-                }:
-                    support_files.append(p)
+        st.markdown(
+            "**Upload supporting documents** (e.g. medical certificates, employer letters, "
+            "QTAC offers, etc.). These can be images, PDFs, Word documents, or text files."
+        )
 
+        uploaded_supporting = st.file_uploader(
+            "Supporting documents",
+            type=["png", "jpg", "jpeg", "pdf", "docx", "txt"],
+            accept_multiple_files=True,
+        )
 
-        if not support_files:
-            st.info(
-                "No supporting documents found in "
-                f"`{support_dir}`.\n\n"
-                "For testing, place PNG/JPEG/PDF files in that folder."
-            )
-        else:
-            st.markdown("**Supporting documents found:**")
-            for p in support_files:
+        support_paths: List[Path] = []
+        if uploaded_supporting:
+            for f in uploaded_supporting:
+                target_path = UPLOAD_SUPPORT_DIR / f.name
+                target_path.write_bytes(f.getbuffer())
+                support_paths.append(target_path)
+
+            st.markdown("**Files received:**")
+            for p in support_paths:
                 st.write(f"- {p.name}")
+        else:
+            st.info("No supporting documents uploaded yet.")
 
         notes = st.text_area(
             "Case officer notes (optional)",
             placeholder="E.g. summary of phone conversation, clarifications from student, etc.",
         )
 
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            generate_clicked = st.button("Generate Investigation Report")
+        generate_clicked = st.button("Generate Investigation Report")
 
         if generate_clicked:
+            if not support_paths:
+                st.warning(
+                    "It's strongly recommended to upload at least one supporting document before generating the report."
+                )
+
             with st.spinner("Generating Special Circumstances Investigation Report..."):
                 inputs = SpecialCircumstancesInputs(
                     date_requested=date_requested,
                     workbook_summary=report_summary,
                     financial_report_text=report_text,
-                    supporting_document_paths=support_files,
+                    supporting_document_paths=support_paths,
                     case_officer_notes=notes or None,
-                    # You can wire these up from other UI fields later if you like
+                    # These can be wired to extra UI fields later if needed
                     student_name=None,
                     student_number=None,
                     program_name=None,
@@ -247,9 +393,10 @@ if sc_enabled:
                         f"Details: {e}"
                     )
 
-# -----------------------------
+# -------------------------------------------------
 # Debug: raw sheets (always show raw, full sheets)
-# -----------------------------
+# -------------------------------------------------
+
 with st.expander("Show raw Study Plan"):
     raw_sp = pd.read_excel(study_plan_path, engine="openpyxl", dtype=str)
     st.dataframe(raw_sp, use_container_width=True)
@@ -267,6 +414,6 @@ csv = df_full.to_csv(index=False)
 st.download_button(
     label="Download Unit Summary as CSV",
     data=csv,
-    file_name=f"{student_choice}_unit_summary.csv",
+    file_name="unit_summary.csv",
     mime="text/csv",
 )
