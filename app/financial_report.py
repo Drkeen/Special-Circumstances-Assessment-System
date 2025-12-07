@@ -34,12 +34,12 @@ class FinancialBreakdown:
     # Per-category summaries
     categories: Dict[str, CategorySummary]
 
-    # Overall totals
+    # Overall totals (Pre + Post + Fee)
     total_impact: Decimal
     start_balance: Optional[Decimal]
     end_balance: Optional[Decimal]
 
-    # “Section 2” (after PreEASD reversals)
+    # “Section 2” (after PreEASD reversals; only Post+Fee left)
     adjusted_start_balance: Optional[Decimal]
     adjusted_end_balance: Optional[Decimal]
 
@@ -113,9 +113,7 @@ def _format_category_line(label: str, cat: CategorySummary) -> str:
     if num_units == 0:
         return f"{label}: (0 units at $0.00) = $0.00"
 
-    # Build price expression
     parts: List[str] = []
-    # Sort by price just for determinism
     for price in sorted(cat.price_counts.keys()):
         count = cat.price_counts[price]
         parts.append(f"{count} at {_format_currency(price)}")
@@ -144,7 +142,6 @@ def compute_financial_breakdown(
     AND for downstream logic (e.g. the Recommendation in Section 12).
     """
 
-    # Earliest enrolment start across ALL units (not just impacted)
     earliest_start = (
         min((u.start_date for u in summary.units), default=None)
         if summary.units
@@ -165,13 +162,11 @@ def compute_financial_breakdown(
         if u.unit_code.upper().startswith("VPC"):
             continue
 
-        # Classify based on date requested and engagement
         days_diff = (date_requested - u.start_date).days
 
         if days_diff <= 14:
             cat_name = CATEGORY_PRE
         else:
-            # > 2 weeks after start
             if u.recorded_hours is None or u.recorded_hours == 0:
                 cat_name = CATEGORY_POST
             else:
@@ -180,12 +175,10 @@ def compute_financial_breakdown(
         impacted_units.append((u, cat_name))
         category_units[cat_name].append(u)
 
-    # Build per-category summaries
     categories: Dict[str, CategorySummary] = {}
     for name, units in category_units.items():
         categories[name] = _make_category_summary(name, units)
 
-    # Totals
     pre = categories[CATEGORY_PRE]
     post = categories[CATEGORY_POST]
     fee = categories[CATEGORY_FEE]
@@ -197,7 +190,7 @@ def compute_financial_breakdown(
     if start_balance is not None:
         end_balance = start_balance - total_impact
 
-    # “Section 2” – after applying PreEASD reversals
+    # “Section 2” world – after PreEASD reversals
     adjusted_start_balance: Optional[Decimal] = None
     adjusted_end_balance: Optional[Decimal] = None
     if start_balance is not None:
@@ -225,7 +218,7 @@ def compute_financial_breakdown(
 def _format_financial_report_text(bd: FinancialBreakdown) -> str:
     lines: List[str] = []
 
-    # Section 1 – overall impact
+    # Section 1 – overall
     lines.append(f"Date Requested: {_format_date(bd.date_requested)}")
     lines.append(f"Enrolment Activity Start Date: {_format_date(bd.earliest_start)}")
     lines.append("")
