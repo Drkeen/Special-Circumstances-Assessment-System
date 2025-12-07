@@ -50,6 +50,7 @@ class StudentAccountRow:
       - unit_code: SSP Spk Cd (matches Spk Cd)
       - txn_amount: Txn Amt / Txb Amt (Decimal)
       - txn_date: Used to pick most recent price (if present)
+      - unalloc_amt: Unalloc Amt (per-transaction outstanding amount)
 
     When multiple StudentAccountRow entries exist for a unit_code,
     the most relevant one is selected using:
@@ -59,6 +60,7 @@ class StudentAccountRow:
     unit_code: str                  # SSP Spk Cd (matches Spk Cd)
     txn_amount: Decimal             # Txn Amt / Txb Amt
     txn_date: Optional[date] = None # Used to pick most recent price (if present)
+    unalloc_amt: Optional[Decimal] = None  # From "Unalloc Amt"
 
 
 # -----------------------------
@@ -88,5 +90,9 @@ class UnitSummaryRow:
 
 @dataclass
 class WorkbookUnitSummary:
-    """Container for all final unit rows (for one workbook / student)."""
+    """
+    Container for all final unit rows (for one workbook / student),
+    plus account-level financial info.
+    """
     units: List[UnitSummaryRow]
+    account_balance: Optional[Decimal] = None  # Sum of Unalloc Amt across all transactions

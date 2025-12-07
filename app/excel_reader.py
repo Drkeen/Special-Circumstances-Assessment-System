@@ -228,7 +228,8 @@ def parse_student_account(df: pd.DataFrame) -> List[StudentAccountRow]:
     Student Account:
       - SSP Spk Cd -> unit code
       - Txn Amt / Txb Amt -> txn_amount
-      - Txn Date (if available) -> txn_date (for picking the most recent)
+      - Txn Date / Acct Txn Date -> txn_date
+      - Unalloc Amt -> unalloc_amt (per-transaction outstanding amount)
 
     If multiple rows exist for a unit_code, the merge logic later will select:
       - the one with the most recent txn_date, if any dates exist
@@ -245,7 +246,12 @@ def parse_student_account(df: pd.DataFrame) -> List[StudentAccountRow]:
     if missing:
         raise ValueError(f"Student Account sheet missing columns: {missing}")
 
-    has_txn_date = "Txn Date" in df.columns
+    # Txn date column can be named a couple of ways
+    txn_date_candidates = ["Txn Date", "Acct Txn Date"]
+    txn_date_col = next((c for c in txn_date_candidates if c in df.columns), None)
+
+    # Unallocated amount column (for account balance)
+    unalloc_col = "Unalloc Amt" if "Unalloc Amt" in df.columns else None
 
     rows: List[StudentAccountRow] = []
     for _, row in df.iterrows():
@@ -255,13 +261,19 @@ def parse_student_account(df: pd.DataFrame) -> List[StudentAccountRow]:
             # ignore zero/blank/invalid amounts
             continue
 
-        txn_date = _to_date(row["Txn Date"]) if has_txn_date else None
+        if txn_date_col:
+            txn_date = _to_date(row[txn_date_col])
+        else:
+            txn_date = None
+
+        unalloc_amt = _to_decimal(row[unalloc_col]) if unalloc_col else None
 
         rows.append(
             StudentAccountRow(
                 unit_code=unit_code,
                 txn_amount=amount,
                 txn_date=txn_date,
+                unalloc_amt=unalloc_amt,
             )
         )
 
@@ -287,6 +299,10 @@ def build_unit_summary(
       - Student Account matched on unit_code; if multiple rows, we pick:
           * the one with the most recent txn_date, if available
           * otherwise, the last occurrence seen.
+
+    Also computes:
+      - account_balance: sum of Unalloc Amt across all StudentAccountRow entries
+        (or None if no Unalloc Amt is present).
     """
 
     # Map (unit_code, start_date) -> UnitEngagementRow
@@ -294,7 +310,7 @@ def build_unit_summary(
     for r in unit_engagement:
         engagement_map[(r.unit_code, r.start_date)] = r
 
-    # Map unit_code -> most relevant StudentAccountRow
+    # Map unit_code -> most relevant StudentAccountRow for pricing
     price_map: Dict[str, StudentAccountRow] = {}
     for r in student_account:
         existing = price_map.get(r.unit_code)
@@ -312,6 +328,17 @@ def build_unit_summary(
             elif not r.txn_date and not existing.txn_date:
                 price_map[r.unit_code] = r
             # else: existing has date, new doesn't -> keep existing
+
+    # Compute overall account balance: sum of Unalloc Amt
+    account_balance: Optional[Decimal] = None
+    total_unalloc = Decimal("0")
+    has_unalloc = False
+    for sa in student_account:
+        if sa.unalloc_amt is not None:
+            total_unalloc += sa.unalloc_amt
+            has_unalloc = True
+    if has_unalloc:
+        account_balance = total_unalloc
 
     # Build the summary rows (Study Plan is the driver)
     summary_rows: List[UnitSummaryRow] = []
@@ -334,7 +361,7 @@ def build_unit_summary(
             )
         )
 
-    return WorkbookUnitSummary(units=summary_rows)
+    return WorkbookUnitSummary(units=summary_rows, account_balance=account_balance)
 
 
 # -----------------------------
@@ -391,7 +418,7 @@ def load_unit_summary_from_files(
     )
     sa_df = _read_with_auto_header(
         student_account_path,
-        header_markers=["SSP Spk Cd", "Txn Amt", "Txb Amt", "Txn Date"],
+        header_markers=["SSP Spk Cd", "Txn Amt", "Txb Amt", "Txn Date", "Acct Txn Date"],
     )
 
     sp_rows = parse_study_plan(sp_df)
