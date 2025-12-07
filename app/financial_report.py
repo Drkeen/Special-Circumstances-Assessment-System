@@ -2,34 +2,48 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal
-from typing import List, Optional, Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .models import WorkbookUnitSummary, UnitSummaryRow
 
-CATEGORY_PRE_EASD = "PreEASD EWID"
-CATEGORY_POST_EASD = "PostEASD EWID"
-CATEGORY_FEE_WAIVER = "Fee Waiver"
+CATEGORY_PRE = "PreEASD EWID"
+CATEGORY_POST = "PostEASD EWID"
+CATEGORY_FEE = "Fee Waiver"
+
+ADMIN_FEE = Decimal("100.00")
 
 
 @dataclass
-class CategorisedUnit:
-    unit_code: str
-    category: str
-    unit_price: Decimal
-    start_date: date
+class CategorySummary:
+    name: str
+    units: List[UnitSummaryRow]
+    total: Decimal
+    price_counts: Dict[Decimal, int]  # price -> number of units at that price
 
 
 @dataclass
-class FinancialReportData:
+class FinancialBreakdown:
     date_requested: date
-    earliest_start_date: Optional[date]
-    impacted_units: List[CategorisedUnit]
-    total_units: int
-    total_amount: Decimal
-    start_account_balance: Decimal
-    end_account_balance: Decimal
+    earliest_start: Optional[date]
+
+    # (unit, category_name)
+    impacted_units: List[Tuple[UnitSummaryRow, str]]
+
+    # Per-category summaries
+    categories: Dict[str, CategorySummary]
+
+    # Overall totals
+    total_impact: Decimal
+    start_balance: Optional[Decimal]
+    end_balance: Optional[Decimal]
+
+    # “Section 2” (after PreEASD reversals)
+    adjusted_start_balance: Optional[Decimal]
+    adjusted_end_balance: Optional[Decimal]
+
+    admin_fee: Decimal = ADMIN_FEE
 
 
 # -----------------------------
@@ -37,166 +51,258 @@ class FinancialReportData:
 # -----------------------------
 
 
-def _is_vpc_unit(unit: UnitSummaryRow) -> bool:
-    """Return True if the unit should be ignored due to being a VPC unit."""
-    return unit.unit_code.upper().startswith("VPC")
-
-
-def _categorise_unit(u: UnitSummaryRow, date_requested: date) -> Optional[str]:
-    """
-    Determine which financial category (if any) a unit belongs to.
-
-    Rules:
-      - PreEASD EWID:
-          date_requested <= (unit_start_date + 14 days)
-          (recorded hours do not matter)
-      - PostEASD EWID:
-          date_requested  > (unit_start_date + 14 days)
-          AND no recorded hours
-      - Fee Waiver:
-          date_requested  > (unit_start_date + 14 days)
-          AND recorded hours present
-    """
-    start = u.start_date
-    boundary = start + timedelta(days=14)
-
-    # PreEASD EWID: up to and including 14 days after start
-    if date_requested <= boundary:
-        return CATEGORY_PRE_EASD
-
-    # After 2 weeks:
-    hours = u.recorded_hours
-    has_hours = hours is not None and hours > 0
-
-    if not has_hours:
-        return CATEGORY_POST_EASD
-
-    return CATEGORY_FEE_WAIVER
-
-
-def _fmt_date(d: Optional[date]) -> str:
+def _format_date(d: Optional[date]) -> str:
     if not d:
         return "N/A"
     return d.strftime("%d/%m/%Y")
 
 
-def _fmt_money(amount: Decimal) -> str:
+def _format_currency(amount: Optional[Decimal]) -> str:
     """
-    Format money without thousands separators,
-    with negatives shown as -$123.45 instead of $-123.45.
+    Format Decimal as per your preferences:
+      - negative sign in front of '$'  -> -$123.45
+      - no thousands separator
+      - 2 decimal places
     """
-    sign = "-" if amount < 0 else ""
-    return f"{sign}${abs(amount):.2f}"
+    if amount is None:
+        return "N/A"
+
+    q = amount.quantize(Decimal("0.01"))
+    sign = "-" if q < 0 else ""
+    return f"{sign}${abs(q):.2f}"
 
 
-def _group_by_price(units: List[CategorisedUnit]) -> List[Tuple[int, Decimal]]:
-    """
-    Group units by unit_price.
-
-    Returns a list of (count, price) pairs, sorted by price descending.
-    """
-    groups: Dict[Decimal, int] = {}
+def _make_category_summary(name: str, units: List[UnitSummaryRow]) -> CategorySummary:
+    total = Decimal("0")
+    price_counts: Dict[Decimal, int] = {}
     for u in units:
-        groups[u.unit_price] = groups.get(u.unit_price, 0) + 1
-
-    # Sort by price (high to low just so it's deterministic)
-    return sorted(
-        ((count, price) for price, count in groups.items()),
-        key=lambda x: x[1],
-        reverse=True,
-    )
-
-
-def _category_line(name: str, units: List[CategorisedUnit]) -> str:
-    """
-    Build a line like:
-      PreEASD EWID units: (2 units at $150.00 + 1 unit at $100.00) = $400.00
-
-    If there are no units in the category, we still show 0 and $0.00.
-    """
-    if not units:
-        return (
-            f"{name} units: "
-            f"(0 units at {_fmt_money(Decimal('0'))}) = {_fmt_money(Decimal('0'))}"
-        )
-
-    total = sum((u.unit_price for u in units), Decimal("0"))
-    groups = _group_by_price(units)
-
-    parts: List[str] = []
-    for count, price in groups:
-        unit_word = "unit" if count == 1 else "units"
-        parts.append(f"{count} {unit_word} at {_fmt_money(price)}")
-
-    breakdown = " + ".join(parts)
-    return f"{name} units: ({breakdown}) = {_fmt_money(total)}"
-
-
-# -----------------------------
-# Core report builder
-# -----------------------------
-
-
-def build_financial_report_data(
-    summary: WorkbookUnitSummary,
-    date_requested: date,
-) -> FinancialReportData:
-    """
-    Construct structured financial report data from a WorkbookUnitSummary and a Date Requested.
-
-    - Ignores units whose code starts with 'VPC'.
-    - Only includes units with a non-null unit_price in financial impact.
-    - Uses summary.account_balance as the starting balance (0 if missing).
-    """
-
-    # Filter out VPC units for financial purposes
-    relevant_units: List[UnitSummaryRow] = [
-        u for u in summary.units if not _is_vpc_unit(u)
-    ]
-
-    # Earliest start date among relevant units (or None)
-    earliest_start_date: Optional[date] = None
-    if relevant_units:
-        earliest_start_date = min(u.start_date for u in relevant_units)
-
-    impacted_units: List[CategorisedUnit] = []
-
-    for u in relevant_units:
-        # Need a price to have financial impact
         if u.unit_price is None:
             continue
+        total += u.unit_price
+        price_counts[u.unit_price] = price_counts.get(u.unit_price, 0) + 1
 
-        category = _categorise_unit(u, date_requested)
-        if category is None:
+    return CategorySummary(
+        name=name,
+        units=units,
+        total=total,
+        price_counts=price_counts,
+    )
+
+
+def _merge_categories(name: str, cats: List[CategorySummary]) -> CategorySummary:
+    all_units: List[UnitSummaryRow] = []
+    total = Decimal("0")
+    price_counts: Dict[Decimal, int] = {}
+
+    for c in cats:
+        all_units.extend(c.units)
+        total += c.total
+        for price, count in c.price_counts.items():
+            price_counts[price] = price_counts.get(price, 0) + count
+
+    return CategorySummary(name=name, units=all_units, total=total, price_counts=price_counts)
+
+
+def _format_category_line(label: str, cat: CategorySummary) -> str:
+    """
+    Build lines like:
+      PreEASD EWID units: (8 units at $527.00) = $4216.00
+      Fee Waiver units: (2 at $150.00 + 1 at $100.00) = $400.00
+    """
+    num_units = len(cat.units)
+    if num_units == 0:
+        return f"{label}: (0 units at $0.00) = $0.00"
+
+    # Build price expression
+    parts: List[str] = []
+    # Sort by price just for determinism
+    for price in sorted(cat.price_counts.keys()):
+        count = cat.price_counts[price]
+        parts.append(f"{count} at {_format_currency(price)}")
+
+    price_expr = " + ".join(parts)
+    return f"{label}: ({price_expr}) = {_format_currency(cat.total)}"
+
+
+def _get_category(bd: FinancialBreakdown, name: str) -> CategorySummary:
+    if name in bd.categories:
+        return bd.categories[name]
+    return CategorySummary(name=name, units=[], total=Decimal("0"), price_counts={})
+
+
+# -----------------------------
+# Core computation
+# -----------------------------
+
+
+def compute_financial_breakdown(
+    summary: WorkbookUnitSummary,
+    date_requested: date,
+) -> FinancialBreakdown:
+    """
+    Classify units and compute all financial pieces needed for the report
+    AND for downstream logic (e.g. the Recommendation in Section 12).
+    """
+
+    # Earliest enrolment start across ALL units (not just impacted)
+    earliest_start = (
+        min((u.start_date for u in summary.units), default=None)
+        if summary.units
+        else None
+    )
+
+    impacted_units: List[Tuple[UnitSummaryRow, str]] = []
+    category_units: Dict[str, List[UnitSummaryRow]] = {
+        CATEGORY_PRE: [],
+        CATEGORY_POST: [],
+        CATEGORY_FEE: [],
+    }
+
+    for u in summary.units:
+        # Skip non-financial units
+        if u.unit_price is None:
+            continue
+        if u.unit_code.upper().startswith("VPC"):
             continue
 
-        impacted_units.append(
-            CategorisedUnit(
-                unit_code=u.unit_code,
-                category=category,
-                unit_price=u.unit_price,
-                start_date=u.start_date,
-            )
+        # Classify based on date requested and engagement
+        days_diff = (date_requested - u.start_date).days
+
+        if days_diff <= 14:
+            cat_name = CATEGORY_PRE
+        else:
+            # > 2 weeks after start
+            if u.recorded_hours is None or u.recorded_hours == 0:
+                cat_name = CATEGORY_POST
+            else:
+                cat_name = CATEGORY_FEE
+
+        impacted_units.append((u, cat_name))
+        category_units[cat_name].append(u)
+
+    # Build per-category summaries
+    categories: Dict[str, CategorySummary] = {}
+    for name, units in category_units.items():
+        categories[name] = _make_category_summary(name, units)
+
+    # Totals
+    pre = categories[CATEGORY_PRE]
+    post = categories[CATEGORY_POST]
+    fee = categories[CATEGORY_FEE]
+
+    total_impact = pre.total + post.total + fee.total
+
+    start_balance = summary.account_balance
+    end_balance: Optional[Decimal] = None
+    if start_balance is not None:
+        end_balance = start_balance - total_impact
+
+    # “Section 2” – after applying PreEASD reversals
+    adjusted_start_balance: Optional[Decimal] = None
+    adjusted_end_balance: Optional[Decimal] = None
+    if start_balance is not None:
+        adjusted_start_balance = start_balance - pre.total
+        adjusted_end_balance = adjusted_start_balance - (post.total + fee.total)
+
+    return FinancialBreakdown(
+        date_requested=date_requested,
+        earliest_start=earliest_start,
+        impacted_units=impacted_units,
+        categories=categories,
+        total_impact=total_impact,
+        start_balance=start_balance,
+        end_balance=end_balance,
+        adjusted_start_balance=adjusted_start_balance,
+        adjusted_end_balance=adjusted_end_balance,
+    )
+
+
+# -----------------------------
+# Formatting
+# -----------------------------
+
+
+def _format_financial_report_text(bd: FinancialBreakdown) -> str:
+    lines: List[str] = []
+
+    # Section 1 – overall impact
+    lines.append(f"Date Requested: {_format_date(bd.date_requested)}")
+    lines.append(f"Enrolment Activity Start Date: {_format_date(bd.earliest_start)}")
+    lines.append("")
+
+    lines.append("Impacted Units:")
+    if not bd.impacted_units:
+        lines.append("None")
+    else:
+        for u, cat in bd.impacted_units:
+            price_str = _format_currency(u.unit_price)
+            lines.append(f"{u.unit_code} [{cat}] {price_str}")
+    lines.append("")
+
+    pre = _get_category(bd, CATEGORY_PRE)
+    post = _get_category(bd, CATEGORY_POST)
+    fee = _get_category(bd, CATEGORY_FEE)
+
+    lines.append(_format_category_line("PreEASD EWID units", pre))
+    lines.append(_format_category_line("PostEASD EWID units", post))
+    lines.append(_format_category_line("Fee Waiver units", fee))
+    lines.append("")
+
+    total_cat = _merge_categories("Total Financial Impact", [pre, post, fee])
+    lines.append(_format_category_line("Total Financial Impact", total_cat))
+    lines.append("")
+
+    lines.append(f"Start Account Balance: {_format_currency(bd.start_balance)}")
+    if bd.start_balance is not None and bd.end_balance is not None:
+        lines.append(
+            f"End Account Balance: "
+            f"({_format_currency(bd.start_balance)} - {_format_currency(bd.total_impact)}) "
+            f"= {_format_currency(bd.end_balance)}"
         )
 
-    total_units = len(impacted_units)
-    total_amount = sum((cu.unit_price for cu in impacted_units), Decimal("0"))
+    # Section 2 – after applying PreEASD reversals
+    lines.append("")
+    lines.append("Section 2 – After applying PreEASD EWID fee reversals")
+    lines.append("")
 
-    # Account balance: if None, treat as 0 for now
-    start_balance = (
-        summary.account_balance if summary.account_balance is not None else Decimal("0")
-    )
-    end_balance = start_balance - total_amount
+    lines.append(_format_category_line("PostEASD EWID units", post))
+    lines.append(_format_category_line("Fee Waiver units", fee))
+    lines.append("")
 
-    return FinancialReportData(
-        date_requested=date_requested,
-        earliest_start_date=earliest_start_date,
-        impacted_units=impacted_units,
-        total_units=total_units,
-        total_amount=total_amount,
-        start_account_balance=start_balance,
-        end_account_balance=end_balance,
-    )
+    total_pf_cat = _merge_categories("Total Financial Impact", [post, fee])
+    lines.append(_format_category_line("Total Financial Impact", total_pf_cat))
+    lines.append("")
+
+    lines.append(f"Adjusted Start Account Balance: {_format_currency(bd.adjusted_start_balance)}")
+    if bd.adjusted_start_balance is not None and bd.adjusted_end_balance is not None:
+        post_fee_total = post.total + fee.total
+        lines.append(
+            f"Adjusted End Account Balance: "
+            f"({_format_currency(bd.adjusted_start_balance)} - {_format_currency(post_fee_total)}) "
+            f"= {_format_currency(bd.adjusted_end_balance)}"
+        )
+
+    return "\n".join(lines).strip()
+
+
+# -----------------------------
+# Public API
+# -----------------------------
+
+
+def generate_financial_report(
+    summary: WorkbookUnitSummary,
+    date_requested: date,
+) -> tuple[str, FinancialBreakdown]:
+    """
+    Main entry point for the app.
+
+    Returns:
+      (report_text, FinancialBreakdown)
+    """
+    bd = compute_financial_breakdown(summary, date_requested)
+    text = _format_financial_report_text(bd)
+    return text, bd
 
 
 def generate_financial_report_text(
@@ -204,156 +310,7 @@ def generate_financial_report_text(
     date_requested: date,
 ) -> str:
     """
-    Build the FinancialReportData and render it as text.
-
-    Section 1: Full picture (all categories).
-    Section 2: Adjusted view assuming PreEASD EWID reversals already applied.
+    Convenience wrapper if you only want the text.
     """
-    data = build_financial_report_data(summary, date_requested)
-
-    lines: List[str] = []
-
-    # -----------------------------
-    # SECTION 1 – FULL VIEW
-    # -----------------------------
-    lines.append("SECTION 1 – Full Financial Impact")
-    lines.append("")
-    # Header dates
-    lines.append(f"Date Requested: {_fmt_date(data.date_requested)}")
-    lines.append(f"Enrolment Activity Start Date: {_fmt_date(data.earliest_start_date)}")
-    lines.append("")
-
-    # Impacted units (all categories)
-    lines.append("Impacted Units:")
-    if not data.impacted_units:
-        lines.append("(No financially impacted units)")
-    else:
-        for cu in data.impacted_units:
-            lines.append(
-                f"{cu.unit_code} [{cu.category}] {_fmt_money(cu.unit_price)}"
-            )
-    lines.append("")
-
-    # Split units by category for the summary lines
-    pre_units = [cu for cu in data.impacted_units if cu.category == CATEGORY_PRE_EASD]
-    post_units = [cu for cu in data.impacted_units if cu.category == CATEGORY_POST_EASD]
-    fee_units = [cu for cu in data.impacted_units if cu.category == CATEGORY_FEE_WAIVER]
-
-    pre_line = _category_line(CATEGORY_PRE_EASD, pre_units)
-    post_line = _category_line(CATEGORY_POST_EASD, post_units)
-    fee_line = _category_line(CATEGORY_FEE_WAIVER, fee_units)
-
-    lines.append(pre_line)
-    lines.append(post_line)
-    lines.append(fee_line)
-    lines.append("")
-
-    # Total financial impact – using same grouped breakdown style
-    if not data.impacted_units:
-        total_line = (
-            f"Total Financial Impact: "
-            f"(0 units at {_fmt_money(Decimal('0'))}) = {_fmt_money(Decimal('0'))}"
-        )
-    else:
-        from decimal import Decimal as _D  # avoid shadowing
-
-        groups = _group_by_price(data.impacted_units)
-        parts: List[str] = []
-        for count, price in groups:
-            unit_word = "unit" if count == 1 else "units"
-            parts.append(f"{count} {unit_word} at {_fmt_money(price)}")
-        breakdown = " + ".join(parts)
-        total_line = (
-            f"Total Financial Impact: "
-            f"({breakdown}) = {_fmt_money(data.total_amount)}"
-        )
-
-    lines.append(total_line)
-    lines.append("")
-
-    # Account balances
-    start_str = _fmt_money(data.start_account_balance)
-    impact_str = _fmt_money(data.total_amount)
-    end_str = _fmt_money(data.end_account_balance)
-
-    lines.append(f"Start Account Balance: {start_str}")
-    lines.append(f"End Account Balance: ({start_str} - {impact_str}) = {end_str}")
-    lines.append("")
-    lines.append("")
-
-    # -----------------------------
-    # SECTION 2 – AFTER PREEASD REVERSALS
-    # -----------------------------
-    lines.append("SECTION 2 – After PreEASD EWID Fee Reversals")
-    lines.append("")
-    lines.append(
-        "This section assumes all PreEASD EWID units have already had their fees reversed."
-    )
-    lines.append("Only PostEASD EWID and Fee Waiver units are shown below.")
-    lines.append("")
-
-    # Re-use same dates
-    lines.append(f"Date Requested: {_fmt_date(data.date_requested)}")
-    lines.append(f"Enrolment Activity Start Date: {_fmt_date(data.earliest_start_date)}")
-    lines.append("")
-
-    # Adjusted impacted units: only PostEASD + Fee Waiver
-    adjusted_units = post_units + fee_units
-
-    lines.append("Impacted Units:")
-    if not adjusted_units:
-        lines.append("(No financially impacted units)")
-    else:
-        for cu in adjusted_units:
-            lines.append(
-                f"{cu.unit_code} [{cu.category}] {_fmt_money(cu.unit_price)}"
-            )
-    lines.append("")
-
-    # Category summaries for adjusted view (no PreEASD line here)
-    post_line_adj = _category_line(CATEGORY_POST_EASD, post_units)
-    fee_line_adj = _category_line(CATEGORY_FEE_WAIVER, fee_units)
-
-    lines.append(post_line_adj)
-    lines.append(fee_line_adj)
-    lines.append("")
-
-    # Totals for adjusted view
-    total_pre_amount = sum((u.unit_price for u in pre_units), Decimal("0"))
-    total_postfee_amount = sum((u.unit_price for u in adjusted_units), Decimal("0"))
-
-    if not adjusted_units:
-        total_line_adj = (
-            f"Total Financial Impact: "
-            f"(0 units at {_fmt_money(Decimal('0'))}) = {_fmt_money(Decimal('0'))}"
-        )
-    else:
-        groups_adj = _group_by_price(adjusted_units)
-        parts_adj: List[str] = []
-        for count, price in groups_adj:
-            unit_word = "unit" if count == 1 else "units"
-            parts_adj.append(f"{count} {unit_word} at {_fmt_money(price)}")
-        breakdown_adj = " + ".join(parts_adj)
-        total_line_adj = (
-            f"Total Financial Impact: "
-            f"({breakdown_adj}) = {_fmt_money(total_postfee_amount)}"
-        )
-
-    lines.append(total_line_adj)
-    lines.append("")
-
-    # Adjusted account balances
-    # Start balance after PreEASD reversals applied
-    adjusted_start_balance = data.start_account_balance - total_pre_amount
-    adjusted_end_balance = adjusted_start_balance - total_postfee_amount
-
-    adj_start_str = _fmt_money(adjusted_start_balance)
-    adj_impact_str = _fmt_money(total_postfee_amount)
-    adj_end_str = _fmt_money(adjusted_end_balance)
-
-    lines.append(f"Adjusted Start Account Balance: {adj_start_str}")
-    lines.append(
-        f"Adjusted End Account Balance: ({adj_start_str} - {adj_impact_str}) = {adj_end_str}"
-    )
-
-    return "\n".join(lines)
+    text, _ = generate_financial_report(summary, date_requested)
+    return text
