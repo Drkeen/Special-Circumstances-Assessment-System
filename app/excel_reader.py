@@ -309,7 +309,11 @@ def build_unit_summary(
 
     Rules:
       - Only units from Study Plan with status 'Enrolled' are used.
-      - Unit Engagement matched on (unit_code, start_date).
+      - Unit Engagement matched on (unit_code, start_date) where possible.
+        If that fails, we fall back to any engagement row for that unit_code:
+          * if exactly one row exists for that unit_code, use it
+          * if multiple rows exist, choose the one whose start_date is
+            closest to the Study Plan start_date.
       - Student Account matched on unit_code; if multiple rows, we pick:
           * the one with the most recent txn_date, if available
           * otherwise, the last occurrence seen.
@@ -319,12 +323,24 @@ def build_unit_summary(
         (or None if no Unalloc Amt is present).
     """
 
-    # Map (unit_code, start_date) -> UnitEngagementRow
+    # -----------------------------
+    # 1) Engagement maps
+    # -----------------------------
+
+    # Exact key: (unit_code, start_date)
     engagement_map: Dict[Tuple[str, date], UnitEngagementRow] = {}
+
+    # Fallback: unit_code -> list of UnitEngagementRow
+    engagement_by_unit: Dict[str, List[UnitEngagementRow]] = {}
+
     for r in unit_engagement:
         engagement_map[(r.unit_code, r.start_date)] = r
+        engagement_by_unit.setdefault(r.unit_code, []).append(r)
 
-    # Map unit_code -> most relevant StudentAccountRow for pricing
+    # -----------------------------
+    # 2) Price map (unchanged logic)
+    # -----------------------------
+
     price_map: Dict[str, StudentAccountRow] = {}
     for r in student_account:
         existing = price_map.get(r.unit_code)
@@ -343,29 +359,52 @@ def build_unit_summary(
                 price_map[r.unit_code] = r
             # else: existing has date, new doesn't -> keep existing
 
-    # Compute overall account balance: sum of Unalloc Amt
+    # -----------------------------
+    # 3) Overall account balance
+    # -----------------------------
+
     account_balance: Optional[Decimal] = None
     total_unalloc = Decimal("0")
     has_unalloc = False
     for sa in student_account:
-        if getattr(sa, "unalloc_amt", None) is not None:
-            total_unalloc += sa.unalloc_amt  # type: ignore[arg-type]
+        if sa.unalloc_amt is not None:
+            total_unalloc += sa.unalloc_amt
             has_unalloc = True
     if has_unalloc:
         account_balance = total_unalloc
 
-    # Build the summary rows (Study Plan is the driver)
-    # Build the summary rows (Study Plan is the driver)
+    # -----------------------------
+    # 4) Build UnitSummaryRow list
+    # -----------------------------
+
     summary_rows: List[UnitSummaryRow] = []
+
     for sp in study_plan:
         key = (sp.unit_code, sp.start_date)
+
+        # 4a) Try exact (unit_code, start_date) match first
         engagement = engagement_map.get(key)
+
+        # 4b) Fallback: any engagement row for this unit_code
+        if engagement is None:
+            candidates = engagement_by_unit.get(sp.unit_code, [])
+            if candidates:
+                if len(candidates) == 1:
+                    engagement = candidates[0]
+                else:
+                    # Pick the one whose start_date is closest to the Study Plan start_date
+                    engagement = min(
+                        candidates,
+                        key=lambda r: abs((r.start_date - sp.start_date).days),
+                    )
+
         account = price_map.get(sp.unit_code)
 
         recorded_hours = engagement.recorded_hours if engagement else None
 
-        # Take the txn_amount as the "unit price", but ensure it is never negative.
-        unit_price = None
+        # Unit price comes from the chosen StudentAccountRow, but
+        # a "unit price" for our purposes should never be negative.
+        unit_price: Optional[Decimal] = None
         if account is not None and account.txn_amount is not None:
             unit_price = account.txn_amount
             if unit_price < 0:
@@ -383,7 +422,6 @@ def build_unit_summary(
         )
 
     return WorkbookUnitSummary(units=summary_rows, account_balance=account_balance)
-
 
 
 # -----------------------------
